@@ -1,0 +1,3248 @@
+-- Kaitun Dungeon v1.13
+local source = [====[
+-- Kaitun Dungeon v1.13
+-- Standalone client script. No UI libraries or remote code downloads.
+-- Dungeon logic: banana 28980-29210.
+-- Dragonstorm attack: find dragon aura.lua 750-991 (NPC aura; movement is coordinated).
+-- Buso / Observation / Race V3 / Race V4: banana 6650-6741.
+
+local Config = {
+    WeaponName = "Dragonstorm",
+    ScanRadius = 5000,
+    ShotRange = 450,
+    ShotInterval = 0, -- One shot pair per Heartbeat, matching the supplied aura loop.
+    HoverHeight = 180,
+    MoveSpeed = 300,
+    OrbitRadius = 70,
+    OrbitPeriod = 2,
+    UpdateInterval = 0,
+    UIUpdateInterval = 0.25,
+    EmptyRoomDelay = 2,
+    ExitSettleTime = 2,
+    AutoExitRadius = 1200,
+    AutoStart = true,
+    ShowDuration = 0.24,
+    CardScanInterval = 0.15,
+    CardAppearDelay = 0.35,
+    CardRetryDelay = 1,
+    CardMaxAttempts = 3,
+}
+
+local ClientBootstrap = (function()
+-- Teleport queues can run before the destination has created LocalPlayer/PlayerGui.
+local Bootstrap = {}
+function Bootstrap.Wait(deps)
+    local deadline = deps.clock() + (deps.timeout or 60)
+    local waitingFor = "client initialization"
+    while true do
+        local loaded, client = deps.loaded(), deps.client()
+        local player = deps.player()
+        local job = deps.job and deps.job() or nil
+        if not loaded then waitingFor = "the destination game to load"
+        elseif not client then waitingFor = "a client execution context"
+        elseif deps.job and (not job or job == "") then waitingFor = "the destination server ID"
+        elseif deps.previousJob and job == deps.previousJob then waitingFor = "the destination teleport context"
+        elseif not player then waitingFor = "LocalPlayer"
+        else
+            local gui = deps.gui(player)
+            if gui then return player, gui end
+            waitingFor = "PlayerGui"
+        end
+        if deps.clock() >= deadline then
+            error("Kaitun Dungeon: teleport startup timed out waiting for " .. waitingFor .. ".", 0)
+        end
+        deps.wait(0.1)
+    end
+end
+return Bootstrap
+
+end)()
+local PartyCore = (function()
+-- Pure coordination rules. Only the configured leader publishes assignments.
+local Party = {}
+Party.Protocol = 1
+Party.HeartbeatTTL = 3
+Party.LeaseTTL = 1.5
+Party.LeaseGrace = 0.3
+Party.FollowerDelay = 0.1
+
+local function validId(value)
+    return type(value) == "number" and value > 0 and value % 1 == 0
+end
+
+function Party.NormalizeNames(leader, members, mode)
+    local names, seen = {}, {}
+    local function add(value, required)
+        value = type(value) == "string" and value:match("^%s*(.-)%s*$") or ""
+        value = value:gsub("^@", "")
+        if value == "" then return not required, "Enter the leader's account username." end
+        if not value:match("^[%w_]+$") then return false, "Use account usernames, not display names." end
+        local key = value:lower()
+        if seen[key] then return false, "Each account may appear only once." end
+        seen[key] = true
+        table.insert(names, value)
+        return true
+    end
+    local ok, err = add(leader, true)
+    if not ok then return nil, err end
+    if type(members) ~= "table" or #members > 3 then return nil, "Use at most three member fields." end
+    for index = 1, 3 do
+        ok, err = add(members[index], false)
+        if not ok then return nil, err end
+    end
+    local modes = { normal = "Normal", hard = "Hard", challenge = "Challenge" }
+    mode = type(mode) == "string" and modes[mode:lower()] or nil
+    if not mode then return nil, "Choose Normal, Hard, or Challenge." end
+    return { names = names, count = #names, mode = mode }
+end
+
+function Party.ResolveConfig(normalized, resolve)
+    local roster, ids = {}, {}
+    for index, name in ipairs(normalized.names) do
+        local ok, id = pcall(resolve, name)
+        if not ok or not validId(id) then return nil, "Account lookup failed for " .. name .. "." end
+        if ids[id] then return nil, "Two entries resolve to the same Roblox account." end
+        ids[id] = true
+        table.insert(roster, { name = name, userId = id, slot = index })
+    end
+    return { protocol = Party.Protocol, leaderId = roster[1].userId, roster = roster,
+        count = #roster, mode = normalized.mode }
+end
+
+function Party.ValidateConfig(config)
+    if type(config) ~= "table" or config.protocol ~= Party.Protocol or type(config.roster) ~= "table"
+        or #config.roster < 1 or #config.roster > 4 or config.count ~= #config.roster then
+        return false, "Invalid party configuration."
+    end
+    if config.mode ~= "Normal" and config.mode ~= "Hard" and config.mode ~= "Challenge" then
+        return false, "Invalid dungeon mode."
+    end
+    local ids = {}
+    for index, member in ipairs(config.roster) do
+        if type(member) ~= "table" or not validId(member.userId) or type(member.name) ~= "string"
+            or member.name == "" or member.slot ~= index or ids[member.userId] then
+            return false, "Invalid or duplicate party account."
+        end
+        ids[member.userId] = true
+    end
+    if config.leaderId ~= config.roster[1].userId then return false, "Leader must occupy the first slot." end
+    return true
+end
+
+function Party.Fresh(record, now, ttl)
+    return type(record) == "table" and type(record.time) == "number"
+        and record.time <= now + 1 and now - record.time <= (ttl or Party.HeartbeatTTL)
+end
+
+function Party.Member(config, userId)
+    for _, member in ipairs(config.roster) do if member.userId == userId then return member end end
+end
+
+function Party.AllInLeaderServer(config, peers, leader, presentIds, now)
+    local valid, reason = Party.ValidateConfig(config)
+    if not valid then return false, reason end
+    if not Party.Fresh(leader, now) or leader.userId ~= config.leaderId or leader.phase ~= "lobby"
+        or type(leader.jobId) ~= "string" or leader.jobId == "" then
+        return false, "Waiting for a fresh leader heartbeat in the verified lobby."
+    end
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if not Party.Fresh(peer, now) then return false, "Waiting for shared-workspace heartbeat: " .. member.name end
+        if peer.userId ~= member.userId or type(peer.sessionId) ~= "string" or peer.sessionId == "" then
+            return false, "Account identity/session mismatch: " .. member.name
+        end
+        if peer.jobId ~= leader.jobId or peer.placeId ~= leader.placeId or peer.phase ~= "lobby" then
+            return false, "Waiting for " .. member.name .. " to join the leader's lobby server."
+        end
+        if peer.alive ~= true or peer.ready ~= true or not presentIds[member.userId] then
+            return false, "Waiting for " .. member.name .. " to load and confirm party setup."
+        end
+    end
+    return true
+end
+
+function Party.JoinDecision(config, peers, leader, presentIds, pad, userId, now)
+    if not Party.Member(config, userId) then return { action = "wait", reason = "This account is not in the party." } end
+    if pad and pad.safety == "abort" then return { action = "retry-empty-pad", reason = pad.reason } end
+    if pad and pad.safety == "countdown" then return { action = "hold", reason = pad.reason } end
+    local ready, reason = Party.AllInLeaderServer(config, peers, leader, presentIds, now)
+    if not ready then return { action = "wait", reason = reason } end
+    if type(pad) ~= "table" or not pad.verified or not pad.key then
+        return { action = "wait", reason = "A verified lobby pad mapping is required." }
+    end
+    if pad.safety == "wait" then return { action = "wait", reason = pad.reason } end
+    if pad.safety == "countdown" then return { action = "hold", reason = pad.reason } end
+    if pad.ownerId and pad.ownerId ~= config.leaderId then
+        return { action = "retry-empty-pad", reason = "Another player owns this pad." }
+    end
+    if not pad.ownerConfirmed then
+        return { action = userId == config.leaderId and "leader-enter" or "wait",
+            reason = "The leader must enter first and receive server confirmation." }
+    end
+    if pad.ownerId ~= config.leaderId then
+        return { action = "wait", reason = "The server has not confirmed the configured party leader." }
+    end
+    local member = Party.Member(config, userId)
+    if pad.menuReady == false then
+        return { action = "hold", reason = "Waiting for the leader's join menu." }
+    end
+    if userId ~= config.leaderId then
+        if type(pad.confirmedAt) ~= "number" or now < pad.confirmedAt + (member.slot - 1) * Party.FollowerDelay then
+            return { action = "wait", reason = "Waiting for the leader-first entry delay." }
+        end
+        if pad.insideIds and pad.insideIds[userId] then return { action = "hold", reason = "Party member is ready on the pad." } end
+        return { action = "member-enter", padKey = pad.key }
+    end
+    if pad.mode ~= config.mode or pad.capacity ~= config.count or pad.configured == false then
+        return { action = "configure", mode = config.mode, capacity = config.count,
+            reason = "Verifying the selected dungeon mode." }
+    end
+    for _, expected in ipairs(config.roster) do
+        if not pad.insideIds or not pad.insideIds[expected.userId] then
+            return { action = "hold", reason = "Waiting for " .. expected.name .. " on the pad." }
+        end
+    end
+    if pad.occupancy ~= config.count then
+        return { action = "hold", reason = "Pad occupancy does not match the configured party size." }
+    end
+    return { action = "start", mode = config.mode, capacity = config.count, padKey = pad.key }
+end
+
+local function workerReady(config, member, peers, world, now)
+    local peer = peers[tostring(member.userId)]
+    return Party.Fresh(peer, now) and peer.userId == member.userId and type(peer.sessionId) == "string"
+        and peer.sessionId ~= "" and peer.jobId == world.jobId and peer.placeId == world.placeId
+        and peer.phase == "dungeon" and peer.alive == true and peer.ready == true
+        and not (peer.choosingCard == true and peer.cardMovementBlocked ~= false)
+        and (not world.roomKey or not peer.roomKey or peer.roomKey == world.roomKey)
+end
+
+function Party.AssignTargets(config, peers, world, targets, previous, now)
+    local valid, reason = Party.ValidateConfig(config)
+    if not valid then return nil, reason end
+    if type(world) ~= "table" or type(world.epoch) ~= "string" or world.epoch == "" or type(world.startedAt) ~= "number"
+        or type(world.jobId) ~= "string" or world.jobId == "" then return nil, "World identity is missing." end
+    if now < world.startedAt + Party.LeaseTTL + Party.LeaseGrace then
+        return {}, "Waiting for leases from the previous leader session to expire."
+    end
+    local available, leases, owners = {}, {}, {}
+    for _, target in ipairs(targets) do
+        if type(target.key) == "string" and target.alive then available[target.key] = target end
+    end
+    for key, lease in pairs(previous or {}) do
+        local member = type(lease) == "table" and Party.Member(config, lease.ownerId)
+        if member and lease.epoch == world.epoch and lease.jobId == world.jobId
+            and type(lease.expiresAt) == "number" and available[key] then
+            local peer = peers[tostring(member.userId)]
+            if workerReady(config, member, peers, world, now) and peer.sessionId == lease.ownerSession
+                and not (peer.unresolvedKey == key or peer.unresolved and not peer.unresolvedKey)
+                and lease.expiresAt >= now and not owners[member.userId] then
+                leases[key] = { targetKey = key, ownerId = member.userId, ownerSession = peer.sessionId,
+                    epoch = world.epoch, jobId = world.jobId, placeId = world.placeId,
+                    expiresAt = now + Party.LeaseTTL, revoked = false }
+                owners[member.userId] = true
+            elseif now <= lease.expiresAt + Party.LeaseGrace then
+                -- Do not hand a cached lease to another account before it has expired.
+                local retained = table.clone(lease)
+                retained.revoked = true
+                leases[key] = retained
+            end
+        end
+    end
+    local ordered = {}
+    for key in pairs(available) do table.insert(ordered, key) end
+    table.sort(ordered)
+    for _, member in ipairs(config.roster) do
+        if not owners[member.userId] and workerReady(config, member, peers, world, now) then
+            for _, key in ipairs(ordered) do
+                if not leases[key] then
+                    local peer = peers[tostring(member.userId)]
+                    leases[key] = { targetKey = key, ownerId = member.userId, ownerSession = peer.sessionId,
+                        epoch = world.epoch, jobId = world.jobId, placeId = world.placeId,
+                        expiresAt = now + Party.LeaseTTL, revoked = false }
+                    owners[member.userId] = true
+                    break
+                end
+            end
+        end
+    end
+    return leases
+end
+
+function Party.OwnLease(leases, userId, sessionId, world, now)
+    for _, lease in pairs(leases or {}) do
+        if not lease.revoked and lease.ownerId == userId and lease.ownerSession == sessionId
+            and lease.epoch == world.epoch and lease.jobId == world.jobId and lease.placeId == world.placeId
+            and type(lease.expiresAt) == "number" and now < lease.expiresAt then return lease end
+    end
+end
+
+function Party.AllClear(config, peers, world, enemyCount, now)
+    if enemyCount ~= 0 then return false end
+    local active = 0
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if Party.Fresh(peer, now) and peer.jobId == world.jobId and peer.placeId == world.placeId
+            and peer.phase == "dungeon" and peer.alive
+            and (not world.roomKey or not peer.roomKey or peer.roomKey == world.roomKey) then
+            if peer.enemyCount ~= 0 then return false end
+            if peer.ready then active = active + 1 end
+        end
+    end
+    return active > 0
+end
+
+return Party
+
+end)()
+local SharedFiles = (function()
+-- Double-buffered JSON records. Each key has one writer; readers keep the newest valid slot.
+local Files = {}
+Files.__index = Files
+
+function Files.new(api, codec, folder)
+    for _, name in ipairs({ "readfile", "writefile", "isfile", "isfolder", "makefolder", "listfiles" }) do
+        assert(type(api[name]) == "function", "Shared file API unavailable: " .. name)
+    end
+    assert(folder:match("^[%w_/-]+$") and not folder:find("%.%.", 1, true), "Invalid sync folder")
+    if not api.isfolder(folder) then api.makefolder(folder) end
+    return setmetatable({ api = api, codec = codec, folder = folder, sequences = {}, cache = {} }, Files)
+end
+
+local function safeKey(key)
+    assert(type(key) == "string" and key:match("^[%w_-]+$"), "Invalid record key")
+    return key
+end
+
+function Files:Write(key, payload)
+    key = safeKey(key)
+    if not self.sequences[key] then
+        self:Read(key)
+        self.sequences[key] = self.cache[key] and self.cache[key].sequence or 0
+    end
+    local sequence = (self.sequences[key] or 0) + 1
+    local envelope = { protocol = 1, sequence = sequence, payload = payload }
+    local slot = sequence % 2 == 0 and "a" or "b"
+    local ok, err = pcall(function()
+        self.api.writefile(self.folder .. "/" .. key .. "-" .. slot .. ".json", self.codec.encode(envelope))
+    end)
+    if not ok then return false, tostring(err) end
+    self.sequences[key] = sequence
+    return true
+end
+
+function Files:Read(key, validate)
+    key = safeKey(key)
+    local best
+    for _, slot in ipairs({ "a", "b" }) do
+        local path = self.folder .. "/" .. key .. "-" .. slot .. ".json"
+        local ok, envelope = pcall(function()
+            if not self.api.isfile(path) then return nil end
+            return self.codec.decode(self.api.readfile(path))
+        end)
+        local accepted = true
+        if ok and type(envelope) == "table" and type(envelope.payload) == "table" and validate then
+            local valid, result = pcall(validate, envelope.payload)
+            accepted = valid and result == true
+        end
+        if ok and type(envelope) == "table" and envelope.protocol == 1
+            and type(envelope.sequence) == "number" and type(envelope.payload) == "table"
+            and accepted
+            and (not best or envelope.sequence > best.sequence) then best = envelope end
+    end
+    if best then self.cache[key] = best end
+    return best and best.payload or nil
+end
+
+return Files
+
+end)()
+local TargetRegistry = (function()
+-- Leader-issued opaque target IDs; followers resolve replicated identity or unambiguous position.
+local Registry = {}
+Registry.__index = Registry
+
+local function distance(a, b)
+    local x, y, z = a[1] - b[1], a[2] - b[2], a[3] - b[3]
+    return math.sqrt(x * x + y * y + z * z)
+end
+
+function Registry.new(epoch)
+    return setmetatable({ epoch = epoch, nextId = 0, byObject = setmetatable({}, { __mode = "k" }), live = {} }, Registry)
+end
+
+function Registry:Snapshot(candidates)
+    local descriptors, live = {}, {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.alive and candidate.object and type(candidate.name) == "string" and type(candidate.position) == "table" then
+            local key = self.byObject[candidate.object]
+            if not key then
+                self.nextId = self.nextId + 1
+                key = self.epoch .. "-enemy-" .. self.nextId
+                self.byObject[candidate.object] = key
+            end
+            local descriptor = { key = key, name = candidate.name, position = table.clone(candidate.position),
+                stableId = candidate.stableId, alive = true, objective = candidate.objective == true }
+            table.insert(descriptors, descriptor)
+            live[key] = candidate.object
+        end
+    end
+    self.live = live
+    return descriptors
+end
+
+function Registry.Resolve(descriptor, candidates, cached, maxDistance, ambiguityMargin)
+    if not descriptor then return nil, "No target descriptor." end
+    maxDistance, ambiguityMargin = maxDistance or 100, ambiguityMargin or 8
+    local best, bestDistance, nextDistance = nil, math.huge, math.huge
+    local stableMatches = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.alive and candidate.name == descriptor.name and candidate.object then
+            if descriptor.stableId ~= nil and candidate.stableId == descriptor.stableId then
+                table.insert(stableMatches, candidate.object)
+            elseif descriptor.stableId == nil then
+                local delta = distance(candidate.position, descriptor.position)
+                if candidate.object == cached and delta <= maxDistance then return cached end
+                if delta < bestDistance then
+                    nextDistance, bestDistance, best = bestDistance, delta, candidate.object
+                elseif delta < nextDistance then nextDistance = delta end
+            end
+        end
+    end
+    if descriptor.stableId ~= nil then
+        if #stableMatches == 1 then return stableMatches[1] end
+        return nil, #stableMatches > 1 and "Replicated target ID is not unique." or "Assigned target is not streamed in."
+    end
+    if not best or bestDistance > maxDistance then return nil, "Assigned target is outside the local view." end
+    if nextDistance - bestDistance < ambiguityMargin then return nil, "Same-name enemies overlap; waiting for an unambiguous target." end
+    return best
+end
+
+return Registry
+
+end)()
+local DungeonRecovery = (function()
+-- Dungeon observation may come from any surviving party member; lobby leadership stays fixed.
+local Recovery = {}
+function Recovery.ValidPeer(peer, world, rules, now)
+    return rules.Fresh(peer, now) and peer.jobId == world.jobId and peer.placeId == world.placeId
+        and peer.phase == "dungeon" and peer.alive == true and peer.ready == true
+        and not (peer.choosingCard == true and peer.cardMovementBlocked ~= false)
+        and type(peer.sessionId) == "string" and type(peer.targets) == "table"
+end
+function Recovery.Observer(config, peers, world, previousId, rules, now)
+    local previous = previousId and peers[tostring(previousId)]
+    local frontier
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if Recovery.ValidPeer(peer, world, rules, now) then
+            local room = tonumber(peer.roomKey)
+            if room and (not frontier or room > frontier) then frontier = room end
+        end
+    end
+    local function eligible(peer)
+        return Recovery.ValidPeer(peer, world, rules, now) and (not frontier or tonumber(peer.roomKey) == frontier)
+    end
+    if eligible(previous) and #previous.targets > 0 then return previous end
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if eligible(peer) and #peer.targets > 0 then return peer end
+    end
+    if eligible(previous) then return previous end
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if eligible(peer) then return peer end
+    end
+end
+function Recovery.Acknowledged(config, peers, world, rules, now)
+    for _, member in ipairs(config.roster) do
+        local peer = peers[tostring(member.userId)]
+        if not rules.Fresh(peer, now) or peer.jobId ~= world.jobId or peer.placeId ~= world.placeId
+            or peer.phase ~= "dungeon" then return false end
+        if peer.alive and peer.ready and peer.assignmentEpoch ~= world.epoch then return false end
+    end
+    return true
+end
+function Recovery.Goal(snapshot, current, peers, rules, now)
+    local active = snapshot and snapshot.activeRoom
+    if not snapshot or snapshot.phase ~= "dungeon" or not rules.Fresh(snapshot, now, rules.LeaseTTL)
+        or snapshot.jobId ~= current.jobId or snapshot.placeId ~= current.placeId
+        or current.phase ~= "dungeon" or not current.alive or not current.ready
+        or not active or not active.roomKey then return end
+    local observer = peers[tostring(active.userId)]
+    if not Recovery.ValidPeer(observer, current, rules, now) or observer.sessionId ~= active.sessionId
+        or observer.roomKey ~= active.roomKey then return end
+    if current.roomKey == active.roomKey then return end
+    local ownNumber, activeNumber = tonumber(current.roomKey), tonumber(active.roomKey)
+    if ownNumber and activeNumber then
+        if ownNumber >= activeNumber then return end
+    elseif current.roomKey then
+        if (current.enemyCount or 0) > 0 then return end
+    else return end -- Recovery must know which room's verified exit it is using.
+    return { roomKey = active.roomKey, fromRoom = current.roomKey, userId = active.userId,
+        position = active.position, enemyCount = active.enemyCount, time = snapshot.time }
+end
+return Recovery
+
+end)()
+local LocalCombat = (function()
+-- Shared movement assignments are preferred, but combat must not wait on IPC.
+local Combat = {}
+local function matches(a, b)
+    if not a or not b or a.name ~= b.name then return false end
+    if a.stableId and b.stableId then return a.stableId == b.stableId end
+    if not a.position or not b.position then return false end
+    local x, y, z = a.position[1] - b.position[1], a.position[2] - b.position[2], a.position[3] - b.position[3]
+    return x * x + y * y + z * z <= 144
+end
+function Combat.Select(config, userId, peers, world, candidates, preferred, rules, now)
+    local member = rules.Member(config, userId)
+    if not member or not world.alive or not world.ready then return end
+    local live, unclaimed = {}, {}
+    for _, target in ipairs(candidates) do
+        if target.alive and target.object then table.insert(live, target) end
+    end
+    table.sort(live, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        if (a.stableId ~= nil) ~= (b.stableId ~= nil) then return a.stableId ~= nil end
+        if a.stableId and b.stableId and a.stableId ~= b.stableId then return tostring(a.stableId) < tostring(b.stableId) end
+        for index = 1, 3 do
+            if a.position[index] ~= b.position[index] then return a.position[index] < b.position[index] end
+        end
+        return false
+    end)
+    local function claimed(target, onlyHigherPriority)
+        for _, other in ipairs(config.roster) do
+            local peer = peers[tostring(other.userId)]
+            if other.userId ~= userId and (not onlyHigherPriority or other.slot < member.slot)
+                and rules.Fresh(peer, now) and peer.jobId == world.jobId and peer.placeId == world.placeId
+                and peer.phase == "dungeon" and peer.alive and peer.ready
+                and matches(target, peer.movementTarget) then return true end
+        end
+        return false
+    end
+    for _, target in ipairs(live) do
+        if target.object == preferred and not claimed(target, true) then return target.object end
+        if not claimed(target, false) then table.insert(unclaimed, target) end
+    end
+    local pool = #unclaimed > 0 and unclaimed or live
+    if #pool > 0 then return pool[(member.slot - 1) % #pool + 1].object end
+end
+return Combat
+
+end)()
+local PartyRuntime = (function()
+-- Client actor for a shared executor workspace. Inject real world/pad adapters.
+local Runtime = {}
+Runtime.__index = Runtime
+
+function Runtime.new(deps, rules, registryClass, recovery, combat)
+    return setmetatable({ deps = deps, rules = rules, registryClass = registryClass,
+        recovery = recovery, combat = combat,
+        enabled = false, status = "Party setup is not started.", lastPoll = -math.huge,
+        lastTeleport = -math.huge, leases = {}, peers = {}, rejectedPads = {} }, Runtime)
+end
+
+function Runtime:SetConfig(config)
+    local ok, err = self.rules.ValidateConfig(config)
+    if not ok then return false, err end
+    if not self.rules.Member(config, self.deps.player.userId) then return false, "This account is not included in the party." end
+    if self.enabled then self:Stop() end
+    self.config = config
+    self.requestedLeader = config.leaderId
+    return true
+end
+
+function Runtime:Start()
+    if not self.config then return false, "Confirm account usernames first." end
+    self.enabled = true
+    self.epoch = self.deps.sessionId .. "-" .. tostring(self.deps.clock())
+    self.configEpoch = self.epoch
+    self.lastPoll = -math.huge
+    self.selectedPad = nil
+    self.snapshot, self.cachedTarget, self.cancelUntil = nil, nil, nil
+    self.unresolved, self.unresolvedKey, self.observerId = false, nil, nil
+    self.rejectedPads = {}
+    self.joinRequest, self.joinAttempts, self.nextJoinAt = nil, 0, 0
+    self.joinBlocked = nil
+    self.stage = "party-start"
+    self.status = "Verifying shared workspace and leader server."
+    return true
+end
+
+function Runtime:Stop()
+    if self.selectedPad and self.deps.abortPad then self.deps.abortPad(self.selectedPad, "Party stopped.") end
+    if self.enabled and self.config then
+        if self.config.leaderId == self.deps.player.userId then
+            self.deps.storage:Write("settings-" .. self.config.leaderId,
+                { time = self.deps.clock(), epoch = self.configEpoch, enabled = false, config = self.config })
+        end
+        if self.heartbeat then
+            self.heartbeat.ready = false
+            self.heartbeat.time = self.deps.clock()
+            self.deps.storage:Write("peer-" .. self.config.leaderId .. "-" .. self.deps.player.userId, self.heartbeat)
+        end
+    end
+    self.enabled, self.snapshot, self.cachedTarget = false, nil, nil
+    self.joinRequest, self.stage = nil, "stopped"
+    self.status = "Party coordination stopped."
+end
+
+function Runtime:_settings(now)
+    local deps, leaderId = self.deps, self.requestedLeader
+    if leaderId == deps.player.userId then
+        local ok, err = deps.storage:Write("settings-" .. leaderId,
+            { time = now, epoch = self.configEpoch, enabled = true, config = self.config })
+        if not ok then return false, "Cannot publish party settings: " .. tostring(err) end
+        return true
+    end
+    local settings = deps.storage:Read("settings-" .. leaderId, function(value)
+        return self.rules.Fresh(value, now) and type(value.epoch) == "string"
+            and self.rules.ValidateConfig(value.config) and value.config.leaderId == leaderId
+    end)
+    if not settings then return false, "Leader settings are not visible. Shared workspace may be unavailable." end
+    if not settings.enabled then return false, "The leader has stopped party coordination." end
+    if not self.rules.Member(settings.config, deps.player.userId) then return false, "The leader has not included this account." end
+    if self.configEpoch ~= settings.epoch then
+        self.snapshot, self.cachedTarget, self.leases = nil, nil, {}
+        self.config, self.configEpoch = settings.config, settings.epoch
+        if deps.onConfig then deps.onConfig(self.config) end
+    end
+    return true
+end
+
+function Runtime:_peers(now, world, candidates)
+    local deps, config = self.deps, self.config
+    local reportKey = deps.sessionId .. ":" .. world.jobId .. ":" .. world.placeId
+    if self.reportKey ~= reportKey then
+        self.reportKey = reportKey
+        self.reportRegistry = self.registryClass.new(reportKey)
+    end
+    local report = self.reportRegistry:Snapshot(candidates)
+    while #report > 96 do table.remove(report) end
+    self.heartbeat = {
+        time = now, userId = deps.player.userId, name = deps.player.name, sessionId = deps.sessionId,
+        configEpoch = self.configEpoch, jobId = world.jobId, placeId = world.placeId, phase = world.phase,
+        alive = world.alive == true, ready = world.ready == true, choosingCard = world.choosingCard == true,
+        cardMovementBlocked = world.cardMovementBlocked, movementTarget = world.movementTarget,
+        enemyCount = #candidates, unresolved = self.unresolved == true, unresolvedKey = self.unresolvedKey,
+        targets = report, roomKey = world.roomKey, position = world.position,
+        assignmentEpoch = self.snapshot and self.snapshot.world and self.snapshot.world.epoch or nil,
+    }
+    local ok, err = deps.storage:Write("peer-" .. config.leaderId .. "-" .. deps.player.userId, self.heartbeat)
+    if not ok then return false, "Cannot publish account heartbeat: " .. tostring(err) end
+    local peers = {}
+    for _, member in ipairs(config.roster) do
+        local peer = deps.storage:Read("peer-" .. config.leaderId .. "-" .. member.userId, function(value)
+            return self.rules.Fresh(value, now) and value.userId == member.userId and value.configEpoch == self.configEpoch
+        end)
+        if peer then peers[tostring(member.userId)] = peer end
+    end
+    self.peers = peers
+    return true
+end
+
+function Runtime:_serverJoin(now, world, leader)
+    -- A finishing instance returns through its own completion screen. The
+    -- leader arriving in the hub must never initiate a second transfer here.
+    if world.teleporting then return false end
+    if world.phase == "dungeon" then
+        self.joinRequest, self.joinAttempts, self.nextJoinAt = nil, 0, 0
+        return false
+    end
+    if not leader or not self.rules.Fresh(leader, now) then return false end
+    if leader.jobId == world.jobId and leader.placeId == world.placeId then
+        self.joinRequest, self.joinAttempts, self.nextJoinAt, self.joinBlocked = nil, 0, 0, nil
+        return false
+    end
+    self.stage = "joining-server"
+    self.status = "Joining the leader's lobby server."
+    if leader.phase ~= "lobby" then self.stage, self.status = "leader-not-in-lobby", "Leader is not in a joinable lobby. Waiting for the party." return true end
+    if type(leader.jobId) ~= "string" or leader.jobId == "" or type(leader.placeId) ~= "number" or leader.placeId <= 0 then
+        self.status = "Waiting for a valid leader place ID and job ID." return true
+    end
+    local destination = tostring(leader.placeId) .. ":" .. leader.jobId
+    if self.joinBlocked == destination then
+        self.stage, self.status = "join-blocked", self.joinFailure
+        return true
+    end
+    local request = self.joinRequest
+    if request then
+        if now - request.time < 20 then return true end
+        self:OnTeleportFailed("Teleport did not complete within 20 seconds.", request.placeId)
+    end
+    if now < (self.nextJoinAt or 0) then self.stage = "join-retry" self.status = self.joinFailure or "Waiting to retry leader-server join." return true end
+    if not self.deps.ensureContinuation() then
+        self.stage = "continuation-wait"
+        self.status = "Automatic re-execution API is unavailable; server joining is waiting."
+        return true
+    end
+    self.lastTeleport = now
+    self.joinAttempts = (self.joinAttempts or 0) + 1
+    self.joinRequest = { jobId = leader.jobId, placeId = leader.placeId, time = now }
+    local request = self.joinRequest
+    if self.deps.joinLobby then
+        local ok, result = pcall(self.deps.joinLobby, world, leader)
+        if not ok then self:OnTeleportFailed(tostring(result), leader.placeId)
+        elseif not result or not result.sent then
+            if self.joinRequest == request then self.joinRequest = nil end
+            self.joinAttempts = math.max(self.joinAttempts - 1, 0)
+            self.stage, self.status = result and result.stage or "dungeon-entry", result and result.message or "Waiting for normal dungeon entry."
+        elseif self.joinRequest == request then
+            request.method = result.method
+            self.status = "Requested the leader's server through the game's Server Browser."
+        end
+    else
+        -- Compatibility for dependency-injected transport fixtures.
+        local ok, err = pcall(self.deps.teleport, leader.placeId, leader.jobId)
+        if not ok then self:OnTeleportFailed(tostring(err), leader.placeId) end
+    end
+    return true
+end
+
+function Runtime:OnTeleportFailed(message, placeId)
+    if not self.enabled then return end
+    local now, request = self.deps.clock(), self.joinRequest
+    if request then
+        if placeId and placeId ~= request.placeId then return end
+        self.joinRequest = nil
+        local lower = tostring(message):lower()
+        if lower:find("teleport token", 1, true) or lower:find("not authorized", 1, true)
+            or lower:find("not authorised", 1, true) or lower:find("unauthorized", 1, true) then
+            self.joinBlocked = tostring(request.placeId) .. ":" .. request.jobId
+            self.nextJoinAt = 0
+            self.joinFailure = "The game's join service rejected this destination: " .. tostring(message)
+            self.stage, self.status = "join-blocked", self.joinFailure
+            return
+        end
+        local backoff = math.min(2 ^ math.min((self.joinAttempts or 1) - 1, 3), 8)
+        self.nextJoinAt = now + backoff
+        self.joinFailure = "Leader-server join failed; retrying in " .. backoff .. "s: " .. tostring(message)
+        self.stage, self.status = "join-retry", self.joinFailure
+    elseif self.selectedPad then
+        local key, world = self.selectedPad, self.deps.world()
+        self.deps.abortPad(key, tostring(message))
+        self.stage, self.status = "pad-cancel", "Dungeon teleport failed: " .. tostring(message)
+        if self.config.leaderId == self.deps.player.userId then
+            self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "lobby", jobId = world.jobId,
+                placeId = world.placeId, padKey = key, decision = "abort", reason = self.status }
+            self.deps.storage:Write("state-" .. self.config.leaderId, self.snapshot)
+            self.rejectedPads[key], self.selectedPad, self.cancelUntil = now, nil, now + 2
+        end
+    end
+end
+
+function Runtime:_lobby(now, world, leader)
+    local config, deps = self.config, self.deps
+    local isLeader = deps.player.userId == config.leaderId
+    if isLeader and now < (self.cancelUntil or 0) then
+        if self.snapshot and self.snapshot.decision == "abort" then
+            self.snapshot.time = now
+            deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+        end
+        return -- Keep cancellation visible long enough for delayed followers.
+    end
+    local allHere, reason = self.rules.AllInLeaderServer(config, self.peers, leader, deps.presentIds(), now)
+    if allHere and isLeader and not self.selectedPad and now >= (self.cancelUntil or 0) then
+        self.selectedPad = deps.findEmptyPad(self.rejectedPads)
+        if self.selectedPad then self.padSelectedAt = now end
+    end
+    local leaderState = self.snapshot
+    local key = self.selectedPad
+    if not isLeader then key = leaderState and leaderState.padKey end
+    self.selectedPad = key
+    local pad = key and deps.readPad(key) or nil
+    local abortReason = pad and pad.safety == "abort" and pad.reason
+        or (not isLeader and leaderState and leaderState.decision == "abort" and leaderState.reason)
+    if key and not allHere and not (pad and pad.safety == "countdown") then abortReason = reason end
+    if isLeader and key and self.padSelectedAt and now - self.padSelectedAt > 35 and not (pad and pad.preparing) then
+        abortReason = "Pad setup timed out; stepping off and retrying."
+    end
+    if abortReason then
+        self.stage = "pad-cancel"
+        if deps.abortPad then deps.abortPad(key, abortReason) end
+        self.status = abortReason
+        if isLeader then
+            self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "lobby", jobId = world.jobId,
+                placeId = world.placeId, padKey = key, decision = "abort", reason = abortReason }
+            deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+            if key then self.rejectedPads[key] = now end
+            self.selectedPad, self.cancelUntil = nil, now + 2
+        end
+        return
+    end
+    if not allHere and not (pad and pad.safety == "countdown") then self.stage, self.status = "party-wait", reason return end
+    if isLeader and key and deps.checkEntry then
+        local held, entryReason, failed = deps.checkEntry(key)
+        if held then
+            self.stage, self.status = "pad-reentry", entryReason
+            self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "lobby", jobId = world.jobId,
+                placeId = world.placeId, padKey = key, decision = failed and "abort" or "hold", reason = entryReason,
+                proof = deps.getProof and deps.getProof(key) or nil }
+            deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+            if failed then
+                deps.abortPad(key, entryReason)
+                self.rejectedPads[key], self.selectedPad, self.cancelUntil = now, nil, now + 2
+            end
+            return
+        end
+        pad = deps.readPad(key)
+    end
+    local decision = self.rules.JoinDecision(config, self.peers, leader, deps.presentIds(), pad, deps.player.userId, now)
+    self.status = decision.reason or decision.action
+    self.stage = pad and pad.safety == "countdown" and "countdown" or decision.action
+    if isLeader then
+        self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "lobby", jobId = world.jobId,
+            placeId = world.placeId, padKey = self.selectedPad, decision = decision.action,
+            proof = deps.getProof and deps.getProof(key) or nil }
+        deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+    end
+    if decision.action == "retry-empty-pad" and isLeader then
+        if deps.abortPad then deps.abortPad(key, decision.reason) end
+        self.rejectedPads[self.selectedPad] = now
+        self.selectedPad, self.cancelUntil = nil, now + 2
+    elseif decision.action == "leader-enter" or decision.action == "member-enter"
+        or decision.action == "configure" or decision.action == "start" then
+        local ok, err = deps.applyPad(decision, key)
+        if ok == false then self.status = err or "Pad action is waiting for verified game controls." end
+    end
+end
+
+function Runtime:_dungeon(now, world, candidates)
+    local deps, config = self.deps, self.config
+    if deps.player.userId == config.leaderId then
+        local observer = self.recovery and self.recovery.Observer(config, self.peers, world,
+            self.observerId, self.rules, now) or nil
+        if not self.recovery then observer = self.peers[tostring(config.leaderId)] end
+        self.observerId = observer and observer.userId or self.observerId
+        local source = observer and observer.sessionId or self.lastSource or deps.sessionId
+        self.lastSource = source
+        local worldKey = self.configEpoch .. ":" .. world.jobId .. ":" .. world.placeId .. ":" .. source
+        if self.worldKey ~= worldKey then
+            self.worldKey = worldKey
+            self.world = { epoch = worldKey, jobId = world.jobId, placeId = world.placeId, startedAt = now }
+            self.leases = {}
+        end
+        self.world.roomKey = observer and observer.roomKey or nil
+        if self.recovery and self.recovery.Acknowledged(config, self.peers, self.world, self.rules, now) then
+            self.world.startedAt = math.min(self.world.startedAt, now - self.rules.LeaseTTL - self.rules.LeaseGrace)
+        end
+        local descriptors = observer and observer.targets or {}
+        self.leases = assert(self.rules.AssignTargets(config, self.peers, self.world, descriptors, self.leases, now))
+        self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "dungeon", world = self.world,
+            jobId = world.jobId, placeId = world.placeId, targets = descriptors, leases = self.leases,
+            allClear = self.rules.AllClear(config, self.peers, self.world, #descriptors, now),
+            activeRoom = observer and { userId = observer.userId, sessionId = observer.sessionId,
+                roomKey = observer.roomKey, position = observer.position, enemyCount = observer.enemyCount } or nil }
+        deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+    end
+    local snapshot = self.snapshot
+    self.stage = "target-wait"
+    if not snapshot or snapshot.phase ~= "dungeon" or not self.rules.Fresh(snapshot, now, self.rules.LeaseTTL)
+        or snapshot.jobId ~= world.jobId or snapshot.placeId ~= world.placeId then
+        self.status, self.cachedTarget = "Waiting for fresh leader target assignments.", nil
+        return
+    end
+    local lease = self.rules.OwnLease(snapshot.leases, deps.player.userId, deps.sessionId, snapshot.world, now)
+    if not lease then
+        self.unresolved, self.unresolvedKey = false, nil
+        self.status, self.cachedTarget = snapshot.allClear and "Party room clear." or "Waiting for an available enemy assignment.", nil
+        return
+    end
+    local descriptor
+    for _, target in ipairs(snapshot.targets) do if target.key == lease.targetKey then descriptor = target break end end
+    if not descriptor then self.status, self.cachedTarget = "Assigned enemy disappeared from the leader view.", nil return end
+    local object, reason
+    object = self.reportRegistry.live[lease.targetKey]
+    if not object then object, reason = self.registryClass.Resolve(descriptor, candidates,
+        self.cachedTargetKey == lease.targetKey and self.cachedTarget or nil) end
+    self.unresolved = object == nil
+    self.unresolvedKey = object == nil and lease.targetKey or nil
+    self.cachedTarget, self.cachedTargetKey = object, lease.targetKey
+    self.status = object and "Assigned: " .. descriptor.name or reason
+    self.stage = object and (descriptor.objective and "objectives" or "fighting") or "target-wait"
+end
+
+function Runtime:Tick(force)
+    if not self.enabled then return end
+    local deps, now = self.deps, self.deps.clock()
+    if deps.world().teleporting then return end
+    if not force and now - self.lastPoll < 0.25 then return end
+    self.lastPoll = now
+    local ready, reason = self:_settings(now)
+    if not ready then
+        self.coordinationAllowed = false
+        self.stage = "settings-wait"
+        if self.selectedPad and deps.abortPad then deps.abortPad(self.selectedPad, reason) end
+        self.status, self.snapshot, self.cachedTarget = reason, nil, nil
+        return
+    end
+    self.coordinationAllowed = true
+    local world = deps.world()
+    local candidates = world.phase == "dungeon" and deps.targets() or {}
+    ready, reason = self:_peers(now, world, candidates)
+    if not ready then self.stage, self.status, self.cachedTarget = "sync-error", reason, nil return end
+    local leader = self.peers[tostring(self.config.leaderId)]
+    if deps.player.userId ~= self.config.leaderId then
+        if self:_serverJoin(now, world, leader) then self.snapshot, self.cachedTarget = nil, nil return end
+        self.snapshot = deps.storage:Read("state-" .. self.config.leaderId, function(value)
+            return value.configEpoch == self.configEpoch and self.rules.Fresh(value, now)
+                and value.jobId == world.jobId and value.placeId == world.placeId
+        end)
+    end
+    if world.phase == "lobby" then
+        self.cachedTarget = nil
+        self:_lobby(now, world, leader)
+    elseif world.phase == "dungeon" then self:_dungeon(now, world, candidates)
+    else self.status, self.cachedTarget = "Enter the dungeon lobby using the game's Server Browser > Dungeon tab.", nil end
+end
+
+function Runtime:GetTarget()
+    if not self.enabled or not self.snapshot or not self.cachedTarget then return nil, self.status end
+    local snapshot, now = self.snapshot, self.deps.clock()
+    local current = self.deps.world()
+    if not current.alive or not current.ready or current.choosingCard and current.cardMovementBlocked ~= false then
+        return nil, "Character is not ready for combat."
+    end
+    if snapshot.phase ~= "dungeon" or snapshot.jobId ~= current.jobId or snapshot.placeId ~= current.placeId
+        or not self.rules.Fresh(snapshot, now, self.rules.LeaseTTL) then return nil, "Leader assignment expired." end
+    local lease = self.rules.OwnLease(snapshot.leases, self.deps.player.userId, self.deps.sessionId, snapshot.world, now)
+    if not lease or lease.targetKey ~= self.cachedTargetKey then return nil, "Target lease expired." end
+    return self.cachedTarget
+end
+
+function Runtime:GetRecoveryGoal()
+    if not self.enabled or not self.recovery then return end
+    local current = self.deps.world()
+    current.enemyCount = self.heartbeat and self.heartbeat.enemyCount or 0
+    return self.recovery.Goal(self.snapshot, current, self.peers, self.rules, self.deps.clock())
+end
+
+function Runtime:SelectLocalTarget(candidates, preferred)
+    if not self.enabled or not self.coordinationAllowed or not self.combat then return end
+    local world = self.deps.world()
+    if world.phase ~= "dungeon" or world.teleporting
+        or world.choosingCard and world.cardMovementBlocked ~= false then return end
+    return self.combat.Select(self.config, self.deps.player.userId, self.peers, world,
+        candidates, preferred, self.rules, self.deps.clock())
+end
+
+function Runtime:CanAdvance()
+    local current, own, now = self.deps.world(), self.heartbeat, self.deps.clock()
+    return self.enabled and self.coordinationAllowed and current.phase == "dungeon" and current.alive and current.ready
+        and not current.choosingCard and self.rules.Fresh(own, now, self.rules.LeaseTTL)
+        and own.jobId == current.jobId and own.placeId == current.placeId and own.roomKey == current.roomKey
+        and self.rules.AllClear(self.config, self.peers, current, own.enemyCount, now)
+end
+
+return Runtime
+
+end)()
+local PartyForm = (function()
+-- Each account row owns its confirmation, lookup generation and edit control.
+local PartyForm = {}
+function PartyForm.Create(ui, rules, callbacks, initial)
+    local make, label, button, rounded, connect = ui.make, ui.label, ui.button, ui.rounded, ui.connect
+    local colors, parent = ui.colors, ui.parent
+    local form = { fields = {}, rows = {}, mode = "Normal", running = false }
+    form.host = rounded(make("Frame", {
+        Name = "PartyLobby", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(420, 434),
+        BackgroundColor3 = colors.background, BorderSizePixel = 0, Active = true,
+    }, parent), 16)
+    label(form.host, "Party accounts", UDim2.fromOffset(20, 16), UDim2.fromOffset(360, 26), 18)
+    label(form.host, "PARTY LOBBY", UDim2.fromOffset(21, 47), UDim2.fromOffset(360, 18), 11, colors.accent)
+    form.status = label(form.host, "Confirm each username beside its field. Leave unused members blank.",
+        UDim2.fromOffset(20, 405), UDim2.fromOffset(380, 28), 12, colors.muted)
+    form.status.TextWrapped, form.status.TextYAlignment = true, Enum.TextYAlignment.Top
+    form.status.TextTruncate = Enum.TextTruncate.AtEnd
+    local function stop()
+        if form.running and callbacks.onStop then callbacks.onStop() end
+        form.running, form.config, form.confirmed = false, nil, false
+        if form.start then form.start.Text = "START PARTY" end
+    end
+    local function assemble()
+        local normalized, reason = rules.NormalizeNames(form.fields[1].Text,
+            { form.fields[2].Text, form.fields[3].Text, form.fields[4].Text }, form.mode)
+        if not normalized then return nil, reason end
+        local roster, ids = {}, {}
+        for index, row in ipairs(form.rows) do
+            local text = form.fields[index].Text:match("^%s*(.-)%s*$"):gsub("^@", "")
+            if text ~= "" then
+                if not row.member or row.member.name:lower() ~= text:lower() or row.pending then
+                    return nil, "Confirm " .. (index == 1 and "the party leader" or "Member " .. (index - 1)) .. " beside its username."
+                end
+                if ids[row.member.userId] then return nil, "Each account may appear only once." end
+                ids[row.member.userId] = true
+                table.insert(roster, { name = row.member.name, userId = row.member.userId, slot = #roster + 1 })
+            end
+        end
+        local config = { protocol = rules.Protocol, leaderId = roster[1].userId, roster = roster,
+            count = #roster, mode = form.mode }
+        local valid, err = rules.ValidateConfig(config)
+        if not valid then return nil, err end
+        return config
+    end
+    local function refresh()
+        local config = assemble()
+        form.config, form.confirmed = config, config ~= nil
+        form.start.Text = form.running and "STOP PARTY" or config and "START PARTY (" .. config.count .. ")" or "START PARTY"
+    end
+    local roles = { "Party leader", "Member 1 (optional)", "Member 2 (optional)", "Member 3 (optional)" }
+    for index, role in ipairs(roles) do
+        local y = 77 + (index - 1) * 56
+        label(form.host, role, UDim2.fromOffset(20, y), UDim2.fromOffset(330, 16), 11, colors.muted)
+        local field = rounded(make("TextBox", {
+            Name = "Account" .. index, Position = UDim2.fromOffset(20, y + 20), Size = UDim2.fromOffset(236, 30),
+            BackgroundColor3 = colors.surface, BorderSizePixel = 0, ClearTextOnFocus = false,
+            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = colors.text,
+            TextXAlignment = Enum.TextXAlignment.Left, TextEditable = true, Active = true,
+            PlaceholderText = index == 1 and "Leader username" or "Optional username",
+            Text = initial and initial[index] or "",
+        }, form.host), 7)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 7) }, field)
+        local confirm = button(form.host, "Confirm", UDim2.fromOffset(264, y + 20), UDim2.fromOffset(78, 30))
+        local edit = button(form.host, "Edit", UDim2.fromOffset(350, y + 20), UDim2.fromOffset(48, 30))
+        confirm.Name, edit.Name = "Confirm" .. index, "Edit" .. index
+        local row = { generation = 0, confirm = confirm, edit = edit }
+        form.fields[index], form.rows[index] = field, row
+        connect(edit.Activated, function()
+            stop()
+            row.generation, row.pending, row.member = row.generation + 1, false, nil
+            field.TextEditable, confirm.Text = true, "Confirm"
+            field:CaptureFocus()
+            form.status.Text = "Editing " .. role:lower() .. ". Confirm this row when finished."
+        end)
+        connect(confirm.Activated, function()
+            if row.pending or row.member or form.destroyed then return end
+            stop()
+            local text = field.Text:match("^%s*(.-)%s*$")
+            if text == "" and index > 1 then
+                field.TextEditable, confirm.Text = false, "Empty"
+                refresh()
+                return
+            end
+            local normalized, reason = rules.NormalizeNames(text, {}, form.mode)
+            if not normalized then form.status.Text = reason return end
+            row.generation, row.pending = row.generation + 1, true
+            local generation = row.generation
+            field.TextEditable, confirm.Text = false, "..."
+            callbacks.onConfirm(normalized, function(config, err)
+                if form.destroyed or row.generation ~= generation then return end
+                row.pending = false
+                if not config then
+                    field.TextEditable, confirm.Text = true, "Confirm"
+                    form.status.Text = err or "Account lookup failed."
+                    return
+                end
+                local member = config.roster[1]
+                for otherIndex, other in ipairs(form.rows) do
+                    if otherIndex ~= index and other.member and other.member.userId == member.userId then
+                        field.TextEditable, confirm.Text = true, "Confirm"
+                        form.status.Text = "Each account may appear only once."
+                        return
+                    end
+                end
+                row.member = member
+                field.Text, field.TextEditable, confirm.Text = member.name, false, "Saved"
+                refresh()
+                form.status.Text = role .. " saved. Edit unlocks this field."
+            end)
+        end)
+    end
+    local modes = {}
+    for index, mode in ipairs({ "Normal", "Hard", "Challenge" }) do
+        modes[mode] = button(form.host, mode, UDim2.fromOffset(20 + (index - 1) * 130, 310), UDim2.fromOffset(120, 31))
+        connect(modes[mode].Activated, function()
+            if form.mode ~= mode then stop() end
+            form.mode = mode
+            for name, control in pairs(modes) do control.TextColor3 = name == mode and colors.accent or colors.text end
+            refresh()
+        end)
+    end
+    modes.Normal.TextColor3 = colors.accent
+    form.start = button(form.host, "START PARTY", UDim2.fromOffset(20, 354), UDim2.fromOffset(378, 35), true)
+    connect(form.start.Activated, function()
+        if form.running then stop() refresh() return end
+        local config, reason = assemble()
+        if not config then form.status.Text = reason return end
+        local ok, err = callbacks.onStart(config)
+        if ok == false then form.status.Text = err or "Party start is waiting." return end
+        form.config, form.confirmed, form.running = config, true, true
+        form.start.Text = "STOP PARTY"
+    end)
+    function form:SetStatus(message) self.status.Text = message end
+    function form:Load(config, running)
+        self.config, self.confirmed, self.running, self.mode = config, true, running == true, config.mode
+        for index, field in ipairs(self.fields) do
+            local row, member = self.rows[index], config.roster[index]
+            row.generation, row.pending, row.member = row.generation + 1, false, member
+            field.Text, field.TextEditable = member and member.name or "", false
+            row.confirm.Text = member and "Saved" or "Empty"
+        end
+        for name, control in pairs(modes) do control.TextColor3 = name == self.mode and colors.accent or colors.text end
+        self.start.Text = self.running and "STOP PARTY" or "START PARTY (" .. config.count .. ")"
+    end
+    function form:Destroy()
+        if self.destroyed then return end
+        stop()
+        self.destroyed = true
+        self.host:Destroy()
+    end
+    return form
+end
+return PartyForm
+
+end)()
+local PadSafety = (function()
+-- Pure checks for the exact Initiator/Difficulty/countdown fields in the capture.
+local Safety = {}
+function Safety.Check(config, pad, proof, now)
+    if not pad or not pad.verified then return "wait", "Waiting for the captured lobby pad." end
+    if pad.ownerId and pad.ownerId ~= config.leaderId then
+        return "abort", "Pad ownership belongs to another account."
+    end
+    if pad.minimum and config.count < pad.minimum then
+        return "wait", "This pad requires at least " .. pad.minimum .. " players."
+    end
+    if pad.maximum and config.count > pad.maximum then return "abort", "Party exceeds the server pad limit." end
+    if pad.preparing then
+        if not pad.ownerConfirmed or not proof or not proof.startedAt
+            or proof.startedAt > now + 1 or now - proof.startedAt > 25
+            or proof.leaderId ~= config.leaderId or proof.mode ~= config.mode then
+            return "abort", "Countdown started without the configured leader's Start record."
+        end
+        if pad.mode ~= config.mode then return "abort", "Difficulty changed during countdown." end
+        if proof.partyCount ~= config.count then return "abort", "Start record does not match the configured party." end
+        for _, member in ipairs(config.roster) do
+            if not proof.rosterIds or proof.rosterIds[tostring(member.userId)] ~= true then
+                return "abort", "Start record is missing a configured party account."
+            end
+        end
+        -- Start locks the accepted party. People walking across the pad afterwards
+        -- are geometry observations, not evidence that its locked roster changed.
+        return "countdown", "Leader and party verified; countdown in progress."
+    end
+    if pad.foreignOccupant then return "abort", "An unlisted player entered the pad." end
+    if proof and proof.configured and pad.mode ~= config.mode then
+        return "abort", "Difficulty changed after the leader configured it."
+    end
+    return "ready"
+end
+return Safety
+
+end)()
+local LobbyAdapter = (function()
+-- Verified by the supplied lobby capture; no guessed queue remote arguments.
+local Adapter = {}
+Adapter.__index = Adapter
+function Adapter.new(deps, safety)
+    return setmetatable({ deps = deps, safety = safety, proofs = {}, owners = {}, confirmed = {}, lastAction = {}, entries = {} }, Adapter)
+end
+function Adapter:Phase()
+    local world = self.deps.workspace
+    if world:GetAttribute("IsDungeonHub") == true and world:GetAttribute("IsDungeonInstance") ~= true then
+        local map = world:FindFirstChild("Map")
+        local hub = map and map:FindFirstChild("Simulation Hub")
+        if hub and hub:FindFirstChild("Pads") then return "lobby" end
+    end
+    local map = world:FindFirstChild("Map")
+    if world:GetAttribute("IsDungeonInstance") == true or (map and map:FindFirstChild("Dungeon")) then return "dungeon" end
+    return "unknown"
+end
+function Adapter:Model(key)
+    if self:Phase() ~= "lobby" or type(key) ~= "string" or not key:match("^DUNGEON_TELEPORTER[123]$") then return end
+    local pads = self.deps.workspace.Map["Simulation Hub"]:FindFirstChild("Pads")
+    local model = pads and pads:FindFirstChild(key)
+    local part = model and model:FindFirstChild("Pad")
+    local remote = model and model:FindFirstChild("DungeonSettingsChanged")
+    if part and part:IsA("BasePart") and remote and remote:IsA("RemoteEvent") then return model, part, remote end
+end
+function Adapter:Read(key)
+    local model, part = self:Model(key)
+    if not model then return end
+    local config, now = self.deps.config(), self.deps.clock()
+    if not config then return end
+    local owner = tonumber(model:GetAttribute("Initiator"))
+    if owner == 0 then owner = nil end
+    if self.owners[key] ~= owner then self.owners[key], self.confirmed[key] = owner, now end
+    local ids, foreign = {}, false
+    for _, member in ipairs(self.deps.players:GetPlayers()) do
+        local root = member.Character and member.Character:FindFirstChild("HumanoidRootPart")
+        if root then
+            local point = part.CFrame:PointToObjectSpace(root.Position)
+            if math.abs(point.X) <= part.Size.X / 2 + 0.8 and math.abs(point.Z) <= part.Size.Z / 2 + 0.8
+                and point.Y >= -2 and point.Y <= 10 then
+                ids[member.UserId] = true
+                local included = false
+                for _, expected in ipairs(config.roster) do if expected.userId == member.UserId then included = true break end end
+                if not included then foreign = true end
+            end
+        end
+    end
+    local allInside = true
+    for _, member in ipairs(config.roster) do if not ids[member.userId] then allInside = false end end
+    local pad = { key = key, verified = true, ownerId = owner, ownerConfirmed = owner == config.leaderId,
+        confirmedAt = self.confirmed[key], mode = model:GetAttribute("Difficulty"),
+        minimum = tonumber(model:GetAttribute("MinPlayers")), maximum = tonumber(model:GetAttribute("MaxPlayers")),
+        occupancy = tonumber(model:GetAttribute("NumPlayersOnPad")) or -1, insideIds = ids, allInside = allInside,
+        foreignOccupant = foreign, preparing = model:GetAttribute("PreparingToTeleport") == true,
+        countdown = model:GetAttribute("TeleportCountdown") }
+    local leaderState = self.deps.leaderState()
+    local proof = config.leaderId == self.deps.player.UserId and self.proofs[key]
+        or (leaderState and leaderState.padKey == key and leaderState.proof)
+    if proof and proof.sessionEpoch ~= self.deps.configEpoch() then proof = nil end
+    local verdict, reason = self.safety.Check(config, pad, proof, now)
+    pad.safety, pad.reason = verdict, reason
+    -- No capacity-setting command was observed. Enforce exact roster locally.
+    pad.capacity = config.count
+    pad.configured = proof and proof.configured == true or false
+    pad.menuReady = not self.deps.queueVisible or proof and proof.menuReady == true or false
+    return pad
+end
+function Adapter:FindEmpty(rejected)
+    local _, root = self.deps.root()
+    if not root then return end
+    local best, distance
+    for index = 1, 3 do
+        local key = "DUNGEON_TELEPORTER" .. index
+        local pad = self:Read(key)
+        local _, part = self:Model(key)
+        local rejectedAt = rejected[key]
+        if pad and not pad.ownerId and pad.occupancy == 0 and not pad.preparing and not pad.foreignOccupant
+            and (not rejectedAt or type(rejectedAt) == "number" and self.deps.clock() - rejectedAt > 8) then
+            local d = (part.Position - root.Position).Magnitude
+            if not distance or d < distance then best, distance = key, d end
+        end
+    end
+    return best
+end
+function Adapter:Proof(key) return self.proofs[key] end
+function Adapter:Abort(key, reason)
+    self.proofs[key], self.lastAction[key] = nil, nil
+    self.entries[key] = nil
+    local _, part = self:Model(key)
+    local _, root = self.deps.root()
+    self.deps.release()
+    if root and part then
+        -- Step clear immediately, including when a teleport countdown is active.
+        local localPoint = part.CFrame:PointToObjectSpace(root.Position)
+        if math.abs(localPoint.X) < part.Size.X / 2 + 5 and math.abs(localPoint.Z) < part.Size.Z / 2 + 5 then
+            root.CFrame = part.CFrame * CFrame.new(0, 4, part.Size.Z / 2 + 12)
+        end
+    end
+    self.lastReason = reason
+end
+function Adapter:EntryStep(key)
+    if not self.deps.queueVisible then return false end
+    local config, now = self.deps.config(), self.deps.clock()
+    local pad = self:Read(key)
+    if not pad or config.leaderId ~= self.deps.player.UserId or pad.preparing or pad.safety == "abort" then return false end
+    local proof = self.proofs[key] or { leaderId = config.leaderId, mode = config.mode, sessionEpoch = self.deps.configEpoch() }
+    self.proofs[key] = proof
+    if proof.menuReady or proof.startedAt then return false end
+    local _, part = self:Model(key)
+    local entry = self.entries[key] or { attempts = 0 }
+    self.entries[key] = entry
+    local inside = pad.insideIds[config.leaderId] == true
+    if entry.stage == "leaving" then
+        if inside then
+            self.deps.move(part.CFrame * CFrame.new(0, 3.2, part.Size.Z / 2 + 12))
+        else
+            entry.outsideAt = entry.outsideAt or now
+            if now - entry.outsideAt >= 0.15 and not pad.ownerId then
+                entry.stage, entry.since = "entering", nil
+                self.deps.move(part.CFrame * CFrame.new(0, 3.2, 0))
+            elseif now - entry.outsideAt > 3 then
+                return true, "Pad ownership did not reset after stepping off.", true
+            end
+        end
+        return true, "Join menu did not open; stepping out and back onto the pad."
+    end
+    if not inside then
+        entry.since = nil
+        if entry.stage == "entering" then
+            self.deps.move(part.CFrame * CFrame.new(0, 3.2, 0))
+            return true, "Re-entering the pad to open the join menu."
+        end
+        return false
+    end
+    if self.deps.queueVisible() and pad.ownerConfirmed then
+        proof.menuReady, entry.stage = true, nil
+        return false
+    end
+    entry.since = entry.since or now
+    if now - entry.since >= 1.2 then
+        if entry.attempts >= 3 then return true, "Join menu failed to open after three pad re-entry attempts.", true end
+        entry.attempts, entry.stage, entry.outsideAt = entry.attempts + 1, "leaving", nil
+        self.deps.move(part.CFrame * CFrame.new(0, 3.2, part.Size.Z / 2 + 12))
+    end
+    return true, "Checking that the leader's join menu opened."
+end
+function Adapter:Apply(decision, key)
+    local config, now = self.deps.config(), self.deps.clock()
+    local pad = self:Read(key)
+    if not pad then return false, "Pad unloaded; waiting for replication." end
+    if pad.safety == "abort" then self:Abort(key, pad.reason) return false, pad.reason end
+    if decision.action == "leader-enter" or decision.action == "member-enter" then
+        if decision.action == "member-enter" and not pad.ownerConfirmed then return false, "Leader ownership is not confirmed." end
+        if decision.action == "leader-enter" and pad.ownerId and not pad.ownerConfirmed then return false, "Another account owns the pad." end
+        local _, part = self:Model(key)
+        return self.deps.move(part.CFrame * CFrame.new(0, 3.2, 0))
+    end
+    if config.leaderId ~= self.deps.player.UserId or not pad.ownerConfirmed then return false, "Only the verified leader can configure/start." end
+    local _, _, remote = self:Model(key)
+    local proof = self.proofs[key] or { leaderId = config.leaderId, mode = config.mode, sessionEpoch = self.deps.configEpoch() }
+    self.proofs[key] = proof
+    if decision.action == "configure" then
+        if proof.selectedAt and pad.mode == config.mode and now - proof.selectedAt >= 0.1 then
+            proof.configured = true
+            return true
+        end
+        if now - (self.lastAction[key] or -math.huge) < 0.6 then return true end
+        self.lastAction[key] = now
+        -- Always issue our own selection, even when the pad already displays it.
+        proof.selectedAt = now
+        remote:FireServer("Difficulty", config.mode)
+        return true
+    end
+    if decision.action == "start" then
+        if not pad.configured or not pad.allInside or pad.occupancy ~= config.count then return false, "Waiting for verified mode and exact party occupancy." end
+        if not self.deps.ensureContinuation() then return false, "Executor needs queue_on_teleport or a supported alias for automatic entry." end
+        if proof.startedAt then
+            if now - proof.startedAt > 5 and not pad.preparing then
+                self:Abort(key, "Server did not acknowledge Start.")
+                return false, "Server did not acknowledge Start; stepping off."
+            end
+            return true
+        end
+        proof.startedAt = now
+        proof.partyCount, proof.rosterIds = config.count, {}
+        for _, member in ipairs(config.roster) do proof.rosterIds[tostring(member.userId)] = true end
+        self.deps.publishProof(key, proof) -- Followers receive intent before countdown replication.
+        remote:FireServer("Start")
+        return true
+    end
+    return true
+end
+return Adapter
+
+end)()
+local StatusPanel = (function()
+-- A single action check, independent of the main window and its G shortcut.
+local Panel = {}
+function Panel.Create(ui)
+    local make, colors, clock = ui.make, ui.colors, ui.clock or os.clock
+    local self = { shown = false, serial = 0 }
+    self.host = ui.rounded(make("Frame", { Name = "ActionChecks", AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, 310, 0, 38), Size = UDim2.fromOffset(282, 116),
+        BackgroundColor3 = colors.background, BorderSizePixel = 0, Visible = false }, ui.parent), 12)
+    make("UIStroke", { Color = colors.border, Thickness = 1 }, self.host)
+    self.dot = ui.rounded(make("Frame", { BackgroundColor3 = colors.accent, BorderSizePixel = 0,
+        Position = UDim2.fromOffset(15, 16), Size = UDim2.fromOffset(8, 8) }, self.host), 4)
+    self.title = ui.label(self.host, "", UDim2.fromOffset(35, 10), UDim2.fromOffset(232, 22), 13)
+    self.message = ui.label(self.host, "", UDim2.fromOffset(15, 39), UDim2.fromOffset(252, 53), 12, colors.muted)
+    self.message.TextWrapped = true
+    self.message.TextYAlignment = Enum.TextYAlignment.Top
+    local track = ui.rounded(make("Frame", { Name = "DismissProgress", BackgroundColor3 = colors.surface,
+        BorderSizePixel = 0, Position = UDim2.new(0, 15, 1, -11), Size = UDim2.new(1, -30, 0, 3) }, self.host), 2)
+    self.bar = ui.rounded(make("Frame", { Name = "Remaining", BackgroundColor3 = colors.accent,
+        BorderSizePixel = 0, Size = UDim2.fromScale(1, 1) }, track), 2)
+    function self:Notify(key, title, message, okay)
+        if self.lastNotice == key then
+            if self.shown then self.message.Text = message end
+            return
+        end
+        self.lastNotice = key
+        self.title.Text, self.message.Text = title, message
+        self.dot.BackgroundColor3 = okay and colors.green or colors.accent
+        self.bar.BackgroundColor3 = self.dot.BackgroundColor3
+        local animate = not self.shown
+        self.serial = self.serial + 1
+        self.shown, self.expiresAt, self.host.Visible = true, clock() + 6, true
+        if self.progressTween then self.progressTween:Cancel() end
+        self.bar.Size = UDim2.fromScale(1, 1)
+        self.progressTween = ui.tween(self.bar, { Size = UDim2.fromScale(0, 1) }, 6, Enum.EasingStyle.Linear)
+        if animate then
+            if self.tween then self.tween:Cancel() end
+            self.host.Position = UDim2.new(1, 310, 0, 38)
+            self.tween = ui.tween(self.host, { Position = UDim2.new(1, -16, 0, 38) }, 0.3)
+        end
+    end
+    function self:Update()
+        if not self.shown or clock() < self.expiresAt then return end
+        self.shown, self.serial = false, self.serial + 1
+        local serial = self.serial
+        if self.tween then self.tween:Cancel() end
+        self.tween = ui.tween(self.host, { Position = UDim2.new(1, 310, 0, 38) }, 0.25)
+        task.delay(0.26, function() if self.serial == serial then self.host.Visible = false end end)
+    end
+    function self:Hide()
+        self.serial, self.shown = self.serial + 1, false
+        if self.tween then self.tween:Cancel() end
+        if self.progressTween then self.progressTween:Cancel() end
+        self.host.Visible = false
+    end
+    return self
+end
+return Panel
+
+end)()
+local ReturnToHub = (function()
+-- Activate the real visible completion UI. Never invent a return/skip remote.
+local Return = {}
+local function normalized(text)
+    return (tostring(text or ""):lower():gsub("<[^>]*>", ""):gsub("[^%w]", ""))
+end
+function Return.Matches(buttonText, scopeText, path)
+    local button, scope, location = normalized(buttonText), normalized(scopeText), normalized(path)
+    local skip = button == "skip" or button:find("^skipcountdown") or button:find("^skipwait")
+    local direct = button == "returnnow" or button == "returntohub" or button == "backtohub"
+    if not skip and not direct then return false end
+    local completed = scope:find("dungeoncomplete", 1, true) or scope:find("dungeoncleared", 1, true)
+        or scope:find("dungeonfinished", 1, true) or scope:find("victory", 1, true) or scope:find("dungeonended", 1, true)
+    local countdown = scope:find("returningtohub", 1, true) or scope:find("returntohubin", 1, true)
+        or scope:find("backtohubin", 1, true)
+    local results = location:find("dungeon", 1, true) and (location:find("result", 1, true)
+        or location:find("complete", 1, true) or location:find("finish", 1, true))
+    return (skip and (countdown or (completed or results) and scope:find("hub", 1, true))
+        or direct and (completed or results)) and true or false
+end
+function Return.new(deps)
+    local self = { deps = deps, lastScan = -math.huge, lastAttempt = -math.huge, attempts = 0, active = false }
+    function self:OnTeleportFailed()
+        -- Retry only after the engine explicitly rejects the transfer, never
+        -- because the same completion GUI remains visible during loading.
+        self.submitted, self.pendingUntil, self.button = false, nil, nil
+        self.lastAttempt = deps.clock()
+    end
+    function self:Find()
+        for _, button in ipairs(deps.gui:GetDescendants()) do
+            if button:IsA("GuiButton") and not button:IsDescendantOf(deps.ownGui) and deps.visible(button) then
+                local text = deps.text(button)
+                local lower = normalized(text)
+                if lower == "skip" or lower:find("^skipcountdown") or lower:find("^skipwait")
+                    or lower == "returnnow" or lower == "returntohub" or lower == "backtohub" then
+                    local scope = button.Parent
+                    for _ = 1, 5 do
+                        if not scope or scope == deps.gui then break end
+                        local texts = {}
+                        for _, object in ipairs(scope:GetDescendants()) do
+                            if #texts >= 60 then break end
+                            if (object:IsA("TextLabel") or object:IsA("TextButton")) and deps.visibleText(object) then
+                                table.insert(texts, object.Text)
+                            end
+                        end
+                        if Return.Matches(text, table.concat(texts, " "), scope:GetFullName()) then return button end
+                        if scope:IsA("ScreenGui") then break end
+                        scope = scope.Parent
+                    end
+                end
+            end
+        end
+    end
+    function self:Step()
+        local now = deps.clock()
+        if not deps.allowed() then self.active, self.button, self.pendingUntil = false, nil, nil return false end
+        if self.submitted then
+            self.active = true
+            deps.release()
+            deps.status("Returning to dungeon hub", "Return requested; waiting for the game's server transfer.")
+            return true
+        end
+        if self.pendingUntil then
+            if now < self.pendingUntil then return true end
+            self.pendingUntil = nil
+        end
+        if self.active and self.button and not deps.visible(self.button) then
+            self.active, self.button, self.pendingUntil = false, nil, now + 4
+            deps.status("Returning to dungeon hub", "Skip accepted; waiting for the game to teleport.")
+            return true
+        end
+        if now - self.lastScan < 0.35 then return self.active end
+        self.lastScan = now
+        local button = self:Find()
+        if not button then self.active, self.button = false, nil return false end
+        if button ~= self.button then self.button, self.error = button, nil end
+        self.active = true
+        deps.release()
+        deps.status("Skipping return countdown", self.error or "Using the dungeon completion screen's Skip control.")
+        if self.attempts >= 3 or now - self.lastAttempt < 0.75 then return true end
+        local ok, reason, attempted = deps.click(button, self.attempts + 1)
+        if attempted ~= false then self.attempts, self.lastAttempt = self.attempts + 1, now end
+        if ok and attempted ~= false then self.submitted = true end
+        self.error = not ok and tostring(reason) or nil
+        return true
+    end
+    return self
+end
+return Return
+
+end)()
+local ServerBrowserJoin = (function()
+-- Game-owned join route from find dragon aura.lua: __ServerBrowser("teleport", job).
+-- Cross-place entry uses the existing ServerBrowser Dungeon tab shown by the user.
+local Browser = {}
+local function normal(text) return tostring(text or ""):lower():gsub("<[^>]*>", ""):gsub("[^%w]", "") end
+function Browser.new(deps)
+    return setmetatable({ deps = deps, tabAttempts = 0, lastTab = -math.huge }, { __index = Browser })
+end
+function Browser:Tabs(root)
+    local dungeon, seas = nil, {}
+    for _, object in ipairs(root:GetDescendants()) do
+        if object:IsA("GuiButton") then
+            local labels = { self.deps.text(object) }
+            if object:IsA("TextButton") then table.insert(labels, object.Text) end
+            for _, child in ipairs(object:GetDescendants()) do
+                if child:IsA("TextLabel") then table.insert(labels, child.Text) end
+            end
+            for _, label in ipairs(labels) do
+                local text = normal(label)
+                if text == "dungeon" and (not dungeon or self.deps.visible(object)) then dungeon = object end
+                if text == "sea1" or text == "sea2" or text == "sea3" then seas[text] = true end
+            end
+        end
+    end
+    if dungeon and seas.sea1 and seas.sea2 and seas.sea3 then return dungeon end
+end
+function Browser:JoinButton(root, jobId)
+    for _, object in ipairs(root:GetDescendants()) do
+        if object:IsA("GuiButton") and tostring(object:GetAttribute("Job") or "") == jobId
+            and self.deps.visible(object) then return object end
+    end
+end
+function Browser:Step(world, leader)
+    local deps, now = self.deps, self.deps.clock()
+    local key = world.jobId .. ":" .. leader.placeId .. ":" .. leader.jobId
+    if self.key ~= key then self.key, self.tabAt, self.tabAttempts, self.lastTab = key, nil, 0, -math.huge end
+    local function waiting(message, stage)
+        return { sent = false, stage = stage or "dungeon-entry", message = message }
+    end
+    if world.teleporting then return { sent = true, method = "game-dungeon-entry" } end
+    if world.phase == "dungeon" then
+        return waiting("Finish the current dungeon before regrouping in the lobby.", "dungeon-finish")
+    end
+    if world.phase == "lobby" and world.placeId ~= leader.placeId then
+        return waiting("Lobby place does not match the configured leader.", "join-blocked")
+    end
+    if world.placeId == leader.placeId and world.phase ~= "lobby" then
+        return waiting("Waiting for the dungeon lobby to finish loading.")
+    end
+    local root = deps.gui:FindFirstChild("ServerBrowser")
+    if root ~= self.root then self.root, self.tabAt, self.tabAttempts = root, nil, 0 end
+    if world.placeId ~= leader.placeId then
+        if not root then return waiting("Waiting for the game's Server Browser to load.") end
+        local opened = false
+        if root:IsA("ScreenGui") and not root.Enabled then root.Enabled, opened = true, true end
+        if root:IsA("GuiObject") and not root.Visible then root.Visible, opened = true, true end
+        if opened then self.tabAt = nil return waiting("Opening the game's Server Browser.") end
+        local tab = self:Tabs(root)
+        if not tab then return waiting("Waiting for the Server Browser's Sea 1 / Sea 2 / Sea 3 / Dungeon tabs.") end
+        if not self.tabAt then
+            if self.tabAttempts >= 3 then return waiting("The Dungeon tab did not activate. Open it once in the game's Server Browser.", "join-blocked") end
+            if now - self.lastTab < 0.75 then return waiting("Waiting for the Dungeon tab to respond.") end
+            if not deps.visible(tab) then return waiting("Waiting for the Dungeon tab to become visible.") end
+            local ok, reason, attempted = deps.activate(tab, self.tabAttempts + 1)
+            if attempted ~= false then self.lastTab, self.tabAttempts = now, self.tabAttempts + 1 end
+            if not ok then return waiting(reason or "Dungeon entry is waiting for a usable GUI activation method.") end
+            self.tabAt = now
+            return waiting("Dungeon selected. Waiting for the game to prepare its server list.")
+        end
+        if now - self.tabAt < 0.35 then return waiting("Waiting for the Dungeon server list.") end
+    end
+    -- Prefer an exact, visible native Join control if the browser has it loaded.
+    local join = root and self:JoinButton(root, leader.jobId)
+    if join then
+        local ok, reason, attempted = deps.activate(join, 1)
+        if ok then return { sent = true, method = "game-browser-button" } end
+        if attempted == false then return waiting(reason or "Waiting for the leader's Join control.") end
+        error(reason or "The game's native Join callback failed.")
+    end
+    local remote = deps.replicated:FindFirstChild("__ServerBrowser")
+    if not remote or not remote:IsA("RemoteFunction") then
+        return waiting("The game's server-browser join service is unavailable in this place.", "join-blocked")
+    end
+    deps.request(remote, leader.jobId, leader.placeId)
+    return { sent = true, method = "game-server-browser" }
+end
+return Browser
+
+end)()
+
+local environment = (type(getgenv) == "function" and getgenv()) or _G
+local player, playerGui = ClientBootstrap.Wait({
+    clock = os.clock, wait = task.wait,
+    loaded = function() return game:IsLoaded() end,
+    client = function() return game:GetService("RunService"):IsClient() end,
+    player = function() return game:GetService("Players").LocalPlayer end,
+    gui = function(localPlayer) return localPlayer:FindFirstChild("PlayerGui") end,
+    job = function() return game.JobId end,
+    previousJob = environment.KaitunQueuedFromJob,
+})
+environment.KaitunQueuedFromJob = nil
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local CollectionService = game:GetService("CollectionService")
+local VirtualInputManager
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local sessionKey = "DragonstormDungeonController"
+local previous = environment[sessionKey]
+if type(previous) == "table" and type(previous.Shutdown) == "function" then
+    previous:Shutdown()
+end
+
+local App = { Version = "1.13" }
+local partyRuntime, lobbyAdapter, partyForm, checks, sharedStore, syncError
+local returnToHub, serverJoin
+local continuationReady, continuationError, queuedContinuation = false, nil, false
+local sourcePath = "KaitunDungeon/main-" .. player.UserId .. ".lua"
+local targetCache = { time = -math.huge, root = nil, targets = {} }
+local roomCache = { time = -math.huge, dungeon = nil, rooms = {} }
+local catchUp = {}
+local partyWanted = false
+local function sharedClock() return DateTime.now().UnixTimestampMillis / 1000 end
+local state = {
+    running = true,
+    farming = false,
+    target = nil,
+    status = "Ready when you are",
+    detail = "Equip and fire Dragonstorm at nearby dungeon enemies.",
+    shots = 0,
+    lastShot = -math.huge,
+    emptySince = nil,
+    exitArmed = true,
+    exitPosition = nil,
+    nextRoomAt = 0,
+    dungeon = nil,
+    abilities = table.freeze({ Haki = true, Ken = true, V3 = true, V4 = true }),
+    abilityErrors = {},
+}
+local connections = {}
+local movementTween, movementGoal, movementRoot, hoverBody
+local movementWatch
+local orbitTarget, orbitAngle, orbitActive, lastOrbitTime = nil, 0, false, 0
+local collisionStates = {}
+local shootFunction, shotIndices
+local nextInitAttempt = -math.huge
+local initMessage = "Locating the Dragonstorm attack controller."
+local ui = {}
+local showPanel, hidePanel
+local windowFocused
+pcall(function()
+    if type(isrbxactive) == "function" then windowFocused = isrbxactive() == true end
+end)
+local cardAuto = {
+    active = false, lastScan = -math.huge, seenAt = 0, lastAttempt = -math.huge,
+    attempts = 0, button = nil, token = 0, wasVisible = false, missingSince = nil,
+}
+local usedExits = setmetatable({}, { __mode = "k" })
+local lastAbility = { Haki = -math.huge, Ken = -math.huge, V3 = -math.huge, V4 = -math.huge }
+local hakiBusy = false
+local v4KeyDown = false
+
+local function releaseV4Key()
+    if v4KeyDown and VirtualInputManager then
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+        end)
+    end
+    v4KeyDown = false
+end
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+
+local function characterParts()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if humanoid and root and humanoid.Health > 0 then
+        return character, humanoid, root
+    end
+end
+
+local function dungeonFolder()
+    local map = workspace:FindFirstChild("Map")
+    return map and map:FindFirstChild("Dungeon")
+end
+
+local function roomAt(root)
+    local dungeon = dungeonFolder()
+    if not dungeon or not root then return end
+    if roomCache.dungeon ~= dungeon or os.clock() - roomCache.time > 0.5 then
+        local rooms = {}
+        for _, room in ipairs(dungeon:GetChildren()) do
+            local entrance = room:FindFirstChild("EntranceTeleporter")
+            local exit = room:FindFirstChild("ExitTeleporter")
+            local entryPart = entrance and entrance:FindFirstChild("Root")
+            local exitPart = exit and exit:FindFirstChild("Root")
+            if entryPart or exitPart then table.insert(rooms, { key = room.Name, entrance = entryPart, exit = exitPart }) end
+        end
+        roomCache = { time = os.clock(), dungeon = dungeon, rooms = rooms }
+    end
+    local best, bestDistance = nil, Config.AutoExitRadius
+    for _, room in ipairs(roomCache.rooms) do
+        for index = 1, 2 do
+            local part = room.exit
+            if index == 1 then part = room.entrance end
+            if part and part.Parent and part:IsA("BasePart") then
+                local distance = (part.Position - root.Position).Magnitude
+                if distance < bestDistance then best, bestDistance = room, distance end
+            end
+        end
+    end
+    return best
+end
+
+local function findDragonstorm(character)
+    local equipped = character and character:FindFirstChild(Config.WeaponName)
+    if equipped and equipped:IsA("Tool") then
+        return equipped
+    end
+    local backpack = player:FindFirstChild("Backpack")
+    local stored = backpack and backpack:FindFirstChild(Config.WeaponName)
+    if stored and stored:IsA("Tool") then
+        return stored
+    end
+end
+
+local function getShotRemotes()
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local net = modules and modules:FindFirstChild("Net")
+    local remote = net and net:FindFirstChild("RE/ShootGunEvent")
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local validator = remotes and remotes:FindFirstChild("Validator2")
+    return remote and remote:IsA("RemoteEvent") and remote or nil,
+        validator and validator:IsA("RemoteEvent") and validator or nil
+end
+
+local function readUpvalue(callback, index)
+    local first, second = debug.getupvalue(callback, index)
+    -- Support both executor value-only and Lua name/value return conventions.
+    if type(first) == "string" and second ~= nil then
+        return second
+    end
+    return first
+end
+
+local function shotValues(callback, indices)
+    local values = {}
+    for name, index in pairs(indices) do
+        local value = readUpvalue(callback, index)
+        if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+            return nil
+        end
+        values[name] = value
+    end
+    if values.modulus <= 0 or values.limit <= 0 then
+        return nil
+    end
+    return values
+end
+
+local function initDragon()
+    if shootFunction then
+        return true
+    end
+    if os.clock() < nextInitAttempt then
+        return false, initMessage
+    end
+    nextInitAttempt = os.clock() + 1
+    if type(debug) ~= "table" or type(debug.getupvalues) ~= "function"
+        or type(debug.getupvalue) ~= "function" or type(debug.setupvalue) ~= "function" then
+        initMessage = "This attack method requires debug.getupvalues/getupvalue/setupvalue."
+        return false, initMessage
+    end
+    local controllers = ReplicatedStorage:FindFirstChild("Controllers")
+    local module = controllers and controllers:FindFirstChild("CombatController")
+    if not module then
+        initMessage = "Waiting for ReplicatedStorage.Controllers.CombatController."
+        return false, initMessage
+    end
+    local ok, err = pcall(function()
+        local controller = require(module)
+        if type(controller) ~= "table" or type(controller.Attack) ~= "function" then
+            return
+        end
+        for _, candidate in pairs(debug.getupvalues(controller.Attack)) do
+            if type(candidate) == "function" then
+                for index, value in pairs(debug.getupvalues(candidate)) do
+                    if value == 727595 and type(index) == "number" and index >= 4 then
+                        local indices = {
+                            low = index - 3, multiplier2 = index - 2, high = index - 1,
+                            multiplier = index, modulus = index + 1,
+                            limit = index + 2, counter = index + 3,
+                        }
+                        if shotValues(candidate, indices) then
+                            shootFunction, shotIndices = candidate, indices
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    if not ok then
+        initMessage = "Attack initialization: " .. tostring(err)
+    elseif not shootFunction then
+        initMessage = "Dragonstorm shooting closure was not found; controller layout may have changed."
+    else
+        initMessage = "Dragonstorm attack ready."
+    end
+    return shootFunction ~= nil, initMessage
+end
+
+local function cancelTween()
+    if movementTween then
+        movementTween:Cancel()
+        movementTween = nil
+    end
+    movementGoal = nil
+end
+
+local function releaseMovement()
+    cancelTween()
+    orbitTarget, orbitAngle, orbitActive, lastOrbitTime = nil, 0, false, 0
+    if hoverBody then
+        hoverBody:Destroy()
+        hoverBody = nil
+    end
+    for part, original in pairs(collisionStates) do
+        pcall(function()
+            part.CanCollide = original
+        end)
+    end
+    table.clear(collisionStates)
+    movementRoot = nil
+    movementWatch = nil
+end
+
+local function releaseCardMouse()
+    if cardAuto.mouseHeld and VirtualInputManager then
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(cardAuto.mouseX, cardAuto.mouseY, 0, false, game, 0)
+        end)
+    end
+    cardAuto.mouseHeld = false
+end
+
+local function resetAutoCards(restore)
+    releaseCardMouse()
+    local reopen = cardAuto.wasVisible
+    cardAuto.token = cardAuto.token + 1
+    cardAuto.active, cardAuto.button, cardAuto.missingSince = false, nil, nil
+    cardAuto.movementBlocked = false
+    cardAuto.wasVisible, cardAuto.attempts, cardAuto.error = false, 0, nil
+    cardAuto.lastScan = -math.huge
+    if restore and reopen and state.running and showPanel then showPanel() end
+end
+
+local function cardVisible(button)
+    if button.Active == false then return false end
+    local x = button.AbsolutePosition.X + button.AbsoluteSize.X / 2
+    local y = button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
+    local current = button
+    local screen
+    while current and current ~= playerGui do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("CanvasGroup") and current.GroupTransparency >= 0.99 then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        if current:IsA("ScreenGui") then screen = current end
+        if current:IsA("GuiObject") and current.ClipsDescendants then
+            local position, size = current.AbsolutePosition, current.AbsoluteSize
+            if x < position.X or y < position.Y or x > position.X + size.X or y > position.Y + size.Y then return false end
+        end
+        current = current.Parent
+    end
+    if screen and not screen.IgnoreGuiInset then
+        local inset = GuiService:GetGuiInset()
+        x, y = x + inset.X, y + inset.Y
+    end
+    local camera = workspace.CurrentCamera
+    if camera and (x < 0 or y < 0 or x > camera.ViewportSize.X or y > camera.ViewportSize.Y) then return false end
+    return current == playerGui and button.AbsoluteSize.X > 2 and button.AbsoluteSize.Y > 2
+end
+
+local function cardText(button)
+    local texts = {}
+    if button:IsA("TextButton") and button.Text ~= "" then table.insert(texts, button.Text) end
+    for _, child in ipairs(button:GetDescendants()) do
+        if child:IsA("TextLabel") and child.Text ~= "" then table.insert(texts, child.Text) end
+    end
+    return string.gsub(table.concat(texts, " | "), "<[^>]*>", "")
+end
+
+local function collectCards()
+    local choices = {}
+    -- Exact hierarchy observed twice in the user's trace: PlayerGui.ScreenGui.1.2.
+    for _, screen in ipairs(playerGui:GetChildren()) do
+        if screen:IsA("ScreenGui") and screen.Name == "ScreenGui" and screen.Enabled then
+            for _, frame in ipairs(screen:GetChildren()) do
+                if frame.Name == "1" then
+                    for _, button in ipairs(frame:GetChildren()) do
+                        if button.Name == "2" and button:IsA("GuiButton") and cardVisible(button) then
+                            local text = cardText(button)
+                            if text ~= "" then
+                                local lower = string.lower(text)
+                                local gun = string.find(lower, "%f[%a]gun%f[%A]")
+                                    or string.find(lower, "dragonstorm", 1, true) or string.find(lower, "sniper", 1, true)
+                                local score = 0
+                                if gun then
+                                    score = 70
+                                    if string.find(lower, "stat", 1, true) or string.find(lower, "damage", 1, true)
+                                        or string.find(lower, "deals", 1, true) then score = 100 end
+                                end
+                                table.insert(choices, { button = button, text = text, score = score, screen = screen })
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return choices
+end
+
+local function cardClickPosition(choice)
+    local button, screen = choice.button, choice.screen
+    local x = button.AbsolutePosition.X + button.AbsoluteSize.X / 2
+    local y = button.AbsolutePosition.Y + button.AbsoluteSize.Y / 2
+    local inset = GuiService:GetGuiInset()
+    local candidates = screen.IgnoreGuiInset and { { x, y } } or { { x + inset.X, y + inset.Y }, { x, y } }
+    for _, point in ipairs(candidates) do
+        local hits = playerGui:GetGuiObjectsAtPosition(point[1], point[2])
+        for _, hit in ipairs(hits) do
+            if hit == button or hit:IsDescendantOf(button) then return point[1], point[2] end
+            if hit:IsA("GuiButton") or (hit:IsA("GuiObject") and hit.Active) then break end
+        end
+    end
+end
+
+local function autoCardStep()
+    if not state.farming then return false end
+    local now = os.clock()
+    if now - cardAuto.lastScan < Config.CardScanInterval then return cardAuto.active end
+    cardAuto.lastScan = now
+    local choices = collectCards()
+    if #choices == 0 then
+        if cardAuto.active then
+            cardAuto.missingSince = cardAuto.missingSince or now
+            if now - cardAuto.missingSince >= 0.2 then resetAutoCards(true) end
+        end
+        return cardAuto.active
+    end
+    cardAuto.missingSince = nil
+    local signatureParts = {}
+    for _, choice in ipairs(choices) do table.insert(signatureParts, choice.text) end
+    table.sort(signatureParts)
+    local signature = table.concat(signatureParts, "\n")
+    if cardAuto.active and signature ~= cardAuto.signature then
+        releaseCardMouse()
+        cardAuto.token = cardAuto.token + 1
+        cardAuto.button, cardAuto.attempts, cardAuto.seenAt, cardAuto.error = nil, 0, now, nil
+    end
+    cardAuto.signature = signature
+    if not cardAuto.active then
+        cardAuto.active, cardAuto.seenAt = true, now
+        cardAuto.wasVisible = ui.host and ui.host.Visible or false
+        if hidePanel then hidePanel() end
+    end
+    cardAuto.movementBlocked = type(firesignal) ~= "function" or cardAuto.attempts >= 2 or cardAuto.mouseHeld == true
+    if cardAuto.movementBlocked then releaseMovement() end
+    state.status = "Choosing a dungeon card"
+    state.detail = cardAuto.error or "Gun upgrades first; otherwise a random card."
+    if #choices < 3 or now - cardAuto.seenAt < Config.CardAppearDelay then return true end
+    local selected
+    for _, choice in ipairs(choices) do
+        if choice.button == cardAuto.button then selected = choice break end
+    end
+    if not selected then
+        local best, pool = -1, {}
+        for _, choice in ipairs(choices) do
+            if choice.score > best then best, pool = choice.score, {} end
+            if choice.score == best then table.insert(pool, choice) end
+        end
+        selected = pool[math.random(1, #pool)]
+        cardAuto.button, cardAuto.title = selected.button, selected.text
+        cardAuto.attempts, cardAuto.lastAttempt = 0, -math.huge
+    end
+    if cardAuto.attempts >= Config.CardMaxAttempts then
+        state.detail = "Automatic selection was not confirmed. Choose one card manually."
+        return true
+    end
+    if now - cardAuto.lastAttempt < Config.CardRetryDelay then return true end
+    if (type(firesignal) ~= "function" or cardAuto.attempts >= 2) and not windowFocused then
+        state.detail = "Signal activation is unavailable or unconfirmed; mouse fallback is waiting for Roblox focus."
+        return true
+    end
+    cardAuto.attempts = cardAuto.attempts + 1
+    cardAuto.lastAttempt = now
+    local token, button = cardAuto.token, selected.button
+    local ok, err = pcall(function()
+        local signalName
+        if type(firesignal) == "function" then
+            signalName = cardAuto.attempts == 2 and "Activated" or "MouseButton1Click"
+            if type(getconnections) == "function" and cardAuto.attempts == 1 then
+                local click = getconnections(button.MouseButton1Click)
+                local activated = getconnections(button.Activated)
+                if #click == 0 and #activated > 0 then signalName = "Activated" end
+            end
+            if cardAuto.attempts <= 2 then
+                cardAuto.method = "signal:" .. signalName
+                firesignal(button[signalName])
+                return
+            end
+        end
+        assert(windowFocused, "Mouse fallback is waiting for Roblox to regain focus.")
+        assert(VirtualInputManager, "Mouse input is unavailable; choose the card manually.")
+        local x, y = cardClickPosition(selected)
+        assert(x, "Card is covered by another UI; waiting for a clear click position.")
+        cardAuto.method = "mouse"
+        cardAuto.mouseX, cardAuto.mouseY, cardAuto.mouseHeld = x, y, true
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.delay(0.05, function()
+            if cardAuto.token == token then releaseCardMouse() end
+        end)
+    end)
+    if cardAuto.token == token then cardAuto.error = not ok and tostring(err) or nil end
+    if not ok then releaseCardMouse() end
+    return true
+end
+
+local function holdCharacter(character, root)
+    if movementRoot ~= root then
+        releaseMovement()
+        movementRoot = root
+    end
+    if not hoverBody or not hoverBody.Parent then
+        hoverBody = Instance.new("BodyVelocity")
+        hoverBody.Name = "DragonstormDungeonHold"
+        hoverBody.MaxForce = Vector3.new(100000, 100000, 100000)
+        hoverBody.Velocity = Vector3.zero
+        hoverBody.Parent = root
+    end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if collisionStates[part] == nil then
+                collisionStates[part] = part.CanCollide
+            end
+            part.CanCollide = false
+        end
+    end
+end
+
+local function isObjective(enemy)
+    local id = enemy and enemy:GetAttribute("ID")
+    return dungeonFolder() ~= nil and enemy and enemy.Name == "PropHitboxPlaceholder"
+        and enemy:GetAttribute("HealthEnabled") == false and type(id) == "number" and id > 0
+end
+
+local function priorityTargets(targets, root)
+    local ownRoom = partyWanted and root and roomAt(root)
+    if ownRoom then
+        local here = {}
+        for _, target in ipairs(targets) do
+            local targetRoot = target:FindFirstChild("HumanoidRootPart")
+            local targetRoom = targetRoot and roomAt(targetRoot)
+            if not targetRoom or targetRoom.key == ownRoom.key then table.insert(here, target) end
+        end
+        targets = here
+    end
+    local props = {}
+    for _, target in ipairs(targets) do if isObjective(target) then table.insert(props, target) end end
+    state.objectiveCount = #props
+    return #props > 0 and props or targets
+end
+
+local function enemyParts(enemy, origin)
+    local folder = workspace:FindFirstChild("Enemies")
+    if not folder or not enemy or not enemy:IsA("Model")
+        or not enemy:IsDescendantOf(folder) or Players:GetPlayerFromCharacter(enemy) then
+        return
+    end
+    local humanoid = enemy:FindFirstChildOfClass("Humanoid")
+    local root = enemy:FindFirstChild("HumanoidRootPart")
+    if root and root:IsA("BasePart") and (root.Position - origin.Position).Magnitude <= Config.ScanRadius then
+        if isObjective(enemy) then
+            if not humanoid or humanoid.Health > 0 then return humanoid or enemy, root end
+        elseif humanoid and humanoid.Health > 0 then return humanoid, root end
+    end
+end
+
+local function collectTargets(root)
+    if targetCache.root == root and os.clock() - targetCache.time < 0.15 then
+        local live = {}
+        for _, target in ipairs(targetCache.targets) do if enemyParts(target, root) then table.insert(live, target) end end
+        return priorityTargets(live, root)
+    end
+    local targets = {}
+    local function scanNPC(node, depth)
+        if not node then
+            return
+        end
+        for _, child in ipairs(node:GetChildren()) do
+            local humanoid, enemyRoot = enemyParts(child, root)
+            if humanoid and enemyRoot then
+                table.insert(targets, child)
+            elseif depth < 3 and not child:IsA("BasePart") then
+                scanNPC(child, depth + 1)
+            end
+        end
+    end
+    scanNPC(workspace:FindFirstChild("Enemies"), 0)
+    targetCache = { root = root, time = os.clock(), targets = targets }
+    return priorityTargets(targets, root)
+end
+
+local function describeTarget(enemy, root)
+    local _, part = enemyParts(enemy, root)
+    if not part then return end
+    local objective = isObjective(enemy)
+    local stable = objective and "prop:" .. tostring(enemy:GetAttribute("ID")) or enemy:GetAttribute("UniqueId")
+    return { object = enemy, name = enemy.Name, alive = true, objective = objective == true,
+        position = { part.Position.X, part.Position.Y, part.Position.Z },
+        stableId = (type(stable) == "string" or type(stable) == "number") and tostring(stable) or nil }
+end
+
+local function describeTargets(targets, root)
+    local list = {}
+    for _, enemy in ipairs(targets) do
+        local descriptor = describeTarget(enemy, root)
+        if descriptor then table.insert(list, descriptor) end
+    end
+    return list
+end
+
+local function chooseTarget(root, targets)
+    -- Keep the movement center stable while the source aura picks its own nearest hit.
+    if state.target and table.find(targets, state.target) then
+        return state.target
+    end
+    return targets[1]
+end
+
+local limbParts = {
+    "Head", "UpperTorso", "LowerTorso",
+    "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+    "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg",
+    "HumanoidRootPart",
+}
+
+local function chooseShotPart(root, targets)
+    local nearest, nearestDistance = nil, Config.ShotRange
+    for _, enemy in ipairs(targets) do
+        local _, enemyRoot = enemyParts(enemy, root)
+        if enemyRoot then
+            local distance = (enemyRoot.Position - root.Position).Magnitude
+            if distance < nearestDistance then
+                nearest, nearestDistance = enemy, distance
+            end
+        end
+    end
+    if not nearest then
+        return
+    end
+    local available = {}
+    for _, name in ipairs(limbParts) do
+        local part = nearest:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            table.insert(available, part)
+        end
+    end
+    if #available > 0 then
+        return available[math.random(1, #available)]
+    end
+end
+
+local function moveAbove(root, targetRoot)
+    local now = os.clock()
+    if orbitTarget ~= targetRoot then
+        cancelTween()
+        orbitTarget, orbitAngle, orbitActive, lastOrbitTime = targetRoot, 0, false, now
+        local config = partyWanted and partyRuntime and partyRuntime.config
+        local member = config and PartyCore.Member(config, player.UserId)
+        if member then orbitAngle = math.pi * 2 * (member.slot - 1) / config.count end
+    end
+    local center = targetRoot.Position + Vector3.new(0, Config.HoverHeight, 0)
+    if orbitActive then
+        local delta = math.clamp(now - lastOrbitTime, 0, 0.1)
+        lastOrbitTime = now
+        orbitAngle = (orbitAngle + math.pi * 2 / Config.OrbitPeriod * delta) % (math.pi * 2)
+        local orbitGoal = center + Vector3.new(
+            math.cos(orbitAngle) * Config.OrbitRadius, 0,
+            math.sin(orbitAngle) * Config.OrbitRadius)
+        if (orbitGoal - root.Position).Magnitude <= Config.MoveSpeed * delta + 5 then
+            root.CFrame = CFrame.lookAt(orbitGoal, targetRoot.Position)
+            return true
+        end
+        -- A distant or teleported target needs a new approach, not a position snap.
+        orbitActive = false
+    end
+    local goal = center + Vector3.new(
+        math.cos(orbitAngle) * Config.OrbitRadius, 0,
+        math.sin(orbitAngle) * Config.OrbitRadius)
+    local distance = (root.Position - goal).Magnitude
+    if distance <= 2 then
+        cancelTween()
+        orbitActive, lastOrbitTime = true, now
+        root.CFrame = CFrame.lookAt(goal, targetRoot.Position)
+        return true
+    end
+    if movementTween and movementTween.PlaybackState == Enum.PlaybackState.Playing
+        and movementGoal and (movementGoal - goal).Magnitude < 6 then
+        return false
+    end
+    cancelTween()
+    movementGoal = goal
+    movementTween = TweenService:Create(root,
+        TweenInfo.new(math.max(distance / Config.MoveSpeed, 0.05), Enum.EasingStyle.Linear),
+        { CFrame = CFrame.lookAt(goal, targetRoot.Position) })
+    movementTween:Play()
+    return false
+end
+
+local function shootDragonstorm(tool, character, targetRoot, remote, validator)
+    -- Recheck the exact equipped Tool immediately before the source's shot pair.
+    if tool.Name ~= "Dragonstorm" or tool.Parent ~= character then
+        return
+    end
+    if os.clock() - state.lastShot < Config.ShotInterval then
+        return
+    end
+    state.lastShot = os.clock()
+    local values = shotValues(shootFunction, shotIndices)
+    assert(values, "Dragonstorm shot state changed; restart farming to rediscover its controller.")
+
+    -- Same sequence and Validator2 -> ShootGunEvent order as find dragon aura.lua.
+    local carry = values.low * values.multiplier2
+    local combined = (values.high * values.multiplier2 + values.low * values.multiplier) % values.modulus
+    combined = (combined * values.modulus + carry) % values.limit
+    local high = math.floor(combined / values.modulus)
+    local low = combined - high * values.modulus
+    local counter = values.counter + 1
+    debug.setupvalue(shootFunction, shotIndices.high, high)
+    debug.setupvalue(shootFunction, shotIndices.low, low)
+    debug.setupvalue(shootFunction, shotIndices.counter, counter)
+    validator:FireServer(math.floor(combined / values.limit * 16777215), counter)
+    remote:FireServer(targetRoot.Position, { targetRoot })
+    state.shots = state.shots + 1
+end
+
+local function waitFor(status, detail)
+    state.status, state.detail = status, detail
+    state.target = nil
+    releaseMovement()
+end
+
+local function runAbility(name, callback)
+    local ok, err = pcall(callback)
+    if not state.running then
+        return
+    end
+    if ok then
+        state.abilityErrors[name] = nil
+    else
+        local message = tostring(err)
+        if state.abilityErrors[name] ~= message then
+            warn("[Kaitun Dungeon / " .. name .. "] " .. message)
+        end
+        state.abilityErrors[name] = message
+    end
+end
+
+local function supportStep()
+    if not state.farming or not dungeonFolder() then
+        return
+    end
+    local character = characterParts()
+    if not character then
+        return
+    end
+    local now = os.clock()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local commF = remotes and remotes:FindFirstChild("CommF_")
+    local commE = remotes and remotes:FindFirstChild("CommE")
+
+    if state.abilities.Haki and not character:FindFirstChild("HasBuso")
+        and not hakiBusy and now - lastAbility.Haki >= 1 then
+        lastAbility.Haki = now
+        if commF and commF:IsA("RemoteFunction") then
+            hakiBusy = true
+            task.spawn(function()
+                runAbility("Haki", function()
+                    if state.running and not state.teleporting and state.farming and state.abilities.Haki and player.Character == character then
+                        commF:InvokeServer("Buso")
+                    end
+                end)
+                hakiBusy = false
+            end)
+        else
+            state.abilityErrors.Haki = "CommF_ is unavailable."
+        end
+    end
+    if state.abilities.Ken and now - lastAbility.Ken >= 2 then
+        lastAbility.Ken = now
+        runAbility("Ken", function()
+            assert(commE and commE:IsA("RemoteEvent"), "CommE is unavailable.")
+            commE:FireServer("Ken", true)
+        end)
+    end
+    if state.abilities.V3 and now - lastAbility.V3 >= 30 then
+        lastAbility.V3 = now
+        runAbility("V3", function()
+            assert(commE and commE:IsA("RemoteEvent"), "CommE is unavailable.")
+            commE:FireServer("ActivateAbility")
+        end)
+    end
+    local energy = character:FindFirstChild("RaceEnergy")
+    local transformed = character:FindFirstChild("RaceTransformed")
+    if state.abilities.V4 and energy and energy.Value == 1
+        and not (transformed and transformed.Value) and now - lastAbility.V4 >= 1 then
+        lastAbility.V4 = now
+        runAbility("V4", function()
+            assert(VirtualInputManager, "VirtualInputManager is unavailable.")
+            v4KeyDown = true
+            VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Y, false, game)
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+            v4KeyDown = false
+        end)
+        releaseV4Key()
+    end
+end
+
+local function automaticExit(root)
+    local now = os.clock()
+    local dungeon = dungeonFolder()
+    if state.dungeon ~= dungeon then
+        state.dungeon = dungeon
+        state.emptySince = nil
+        state.exitArmed = true
+        state.exitPosition = nil
+        table.clear(usedExits)
+    end
+    if now < state.nextRoomAt then
+        waitFor("Waiting for the next room", "Auto farm is on and will resume when enemies appear.")
+        return
+    end
+    if not state.exitArmed then
+        -- A server teleport away from the last exit allows another empty room.
+        if state.exitPosition and (root.Position - state.exitPosition).Magnitude > 100 then
+            state.exitArmed = true
+            state.emptySince = nil
+        else
+            waitFor("Waiting for the next wave", "The exit was already used; waiting for enemies or a room transition.")
+            return
+        end
+    end
+    state.emptySince = state.emptySince or now
+    local clearDelay = partyWanted and state.sawRoomTargets and 0.5 or Config.EmptyRoomDelay
+    if now - state.emptySince < clearDelay then
+        waitFor("Checking that the room is clear", "Confirming no enemies remain before using the exit.")
+        return
+    end
+    local closest, bestDistance = nil, Config.AutoExitRadius
+    for _, room in ipairs(dungeon:GetChildren()) do
+        local exit = room:FindFirstChild("ExitTeleporter")
+        local part = exit and exit:FindFirstChild("Root")
+        if part and part:IsA("BasePart") then
+            local distance = (root.Position - part.Position).Magnitude
+            local usedPosition = usedExits[part]
+            local alreadyUsed = usedPosition and (part.Position - usedPosition).Magnitude < 5
+            if not alreadyUsed and distance < bestDistance then
+                closest, bestDistance = part, distance
+            end
+        end
+    end
+    if not closest then
+        waitFor("Waiting for a nearby exit", "No unused exit within 1,200 studs. Auto farm remains on.")
+        return
+    end
+    releaseMovement()
+    state.target = nil
+    state.emptySince = nil
+    state.exitArmed = false
+    state.exitPosition = closest.Position
+    state.nextRoomAt = now + Config.ExitSettleTime
+    usedExits[closest] = closest.Position
+    root.CFrame = closest.CFrame * CFrame.new(0, 3, 0)
+    state.status = "Entering the next room"
+    state.detail = "Auto farm stays on and will continue in the next room."
+end
+
+local function recoverPartyRoom(root, goal)
+    local room, now = roomAt(root), os.clock()
+    if not room or room.key ~= goal.fromRoom or not room.exit or not room.exit.Parent then
+        waitFor("Finding the party route", "Waiting for the current room's exit to load.")
+        return
+    end
+    local exit = room.exit
+    if catchUp.root ~= root or catchUp.exit ~= exit then catchUp = { root = root, exit = exit, attempts = 0, nextAt = 0 } end
+    state.recoveringRoom = goal.roomKey
+    waitFor("Rejoining the party room", "Using this room's exit to rejoin the active party.")
+    if now < catchUp.nextAt then return end
+    if catchUp.attempts >= 3 then catchUp.attempts, catchUp.nextAt = 0, now + 4 return end
+    -- A respawn may reuse an exit already consumed before death. Recovery has its
+    -- own bounded retry latch; normal clear consensus/used-exit rules stay intact.
+    root.CFrame = exit.CFrame * CFrame.new(0, 3, 0)
+    catchUp.attempts, catchUp.nextAt = catchUp.attempts + 1, now + 1.5
+    state.emptySince = nil
+end
+
+local function farmStep()
+    if not state.farming then
+        return
+    end
+    local character, humanoid, root = characterParts()
+    if not character then
+        waitFor("Waiting for your character", "Farming resumes after you respawn.")
+        return
+    end
+    if lobbyAdapter and lobbyAdapter:Phase() == "lobby" then
+        state.status = partyRuntime and partyRuntime.status or "Configure your lobby party"
+        state.detail = syncError or "Confirm leader and members, then start the party on each account."
+        return -- Lobby adapter owns movement; do not cancel its pad tween here.
+    end
+    local dungeon = dungeonFolder()
+    if not dungeon then
+        state.dungeon = nil
+        state.emptySince = nil
+        waitFor("Waiting for the dungeon", "Enter a dungeon first; Map.Dungeon is not loaded.")
+        return
+    end
+    local enemies = workspace:FindFirstChild("Enemies")
+    if not enemies then
+        state.emptySince = nil
+        waitFor("Waiting for enemies", "The Enemies folder is still loading; auto-exit is waiting too.")
+        return
+    end
+    if state.dungeon ~= dungeon then
+        state.dungeon = dungeon
+        state.emptySince = nil
+        state.exitArmed = true
+        state.exitPosition = nil
+        state.nextRoomAt = 0
+        table.clear(usedExits)
+    end
+    local targets = collectTargets(root)
+    local currentRoom = roomAt(root)
+    local roomKey = currentRoom and currentRoom.key
+    if state.combatRoomKey ~= roomKey then
+        state.combatRoomKey, state.sawRoomTargets, state.emptySince = roomKey, false, nil
+    end
+    if #targets > 0 then state.sawRoomTargets = true end
+    if cardAuto.active and cardAuto.movementBlocked then
+        releaseMovement()
+        state.status, state.detail = "Choosing a dungeon card", "Holding position for the card's mouse click."
+        return
+    end
+    local goal = partyWanted and partyRuntime and partyRuntime:GetRecoveryGoal() or nil
+    state.recoveringRoom = nil
+    if goal and not cardAuto.active then
+        recoverPartyRoom(root, goal)
+        return
+    end
+    catchUp = {}
+    -- Respawns put the gun in the Backpack. Re-equip before waiting for an
+    -- assignment so the independent aura also works after a manual room return.
+    local tool = #targets > 0 and findDragonstorm(character) or nil
+    if tool and tool.Parent ~= character then
+        releaseMovement()
+        humanoid:EquipTool(tool)
+        state.status, state.detail = "Equipping Dragonstorm", "Preparing Dragonstorm for combat."
+        return
+    end
+    if partyWanted then
+        local previousTarget = state.target
+        state.target = partyRuntime and partyRuntime:GetTarget() or nil
+        if state.target and not table.find(targets, state.target) then state.target = nil end
+        if not state.target and #targets > 0 and partyRuntime then
+            state.target = partyRuntime:SelectLocalTarget(describeTargets(targets, root), previousTarget)
+        end
+        if not state.target and #targets > 0 then
+            waitFor(state.aura == "Active" and "Dragonstorm aura active" or "Synchronizing party targets",
+                partyRuntime and partyRuntime.status or syncError or "Start party coordination in the lobby.")
+            return
+        end
+    else state.target = chooseTarget(root, targets) end
+    if not state.target then
+        if cardAuto.active then
+            waitFor("Choosing a dungeon card", "The exit will resume after the card choice is confirmed.")
+            return
+        end
+        if partyWanted and not (partyRuntime and partyRuntime:CanAdvance()) then
+            waitFor("Verifying party room clear", partyRuntime and partyRuntime.status or "Waiting for party confirmation.")
+            return
+        end
+        automaticExit(root)
+        return
+    end
+    state.emptySince = nil
+    state.exitArmed = true
+    state.exitPosition = nil
+    tool = tool or findDragonstorm(character)
+    if not tool then
+        waitFor("Dragonstorm not found", "Place Dragonstorm in your Backpack. No other weapon will be used.")
+        return
+    end
+    if tool.Parent ~= character then
+        releaseMovement()
+        humanoid:EquipTool(tool)
+        state.status, state.detail = "Equipping Dragonstorm", "Your weapon is locked to Dragonstorm."
+        return
+    end
+    local _, targetRoot = enemyParts(state.target, root)
+    if not targetRoot then
+        return
+    end
+    holdCharacter(character, root)
+    local orbitReady = moveAbove(root, targetRoot)
+    if not orbitReady then
+        local goal = targetRoot.Position + Vector3.new(math.cos(orbitAngle) * Config.OrbitRadius,
+            Config.HoverHeight, math.sin(orbitAngle) * Config.OrbitRadius)
+        local remaining = (goal - root.Position).Magnitude
+        local now = os.clock()
+        if not movementWatch or movementWatch.target ~= state.target
+            or (movementWatch.center - targetRoot.Position).Magnitude > 6
+            or remaining < movementWatch.best - 3 then
+            movementWatch = { target = state.target, center = targetRoot.Position, best = remaining, time = now }
+        elseif now - movementWatch.time > 8 then
+            releaseMovement()
+            if partyWanted and partyRuntime then
+                partyRuntime.unresolved, partyRuntime.unresolvedKey, partyRuntime.cachedTarget = true, partyRuntime.cachedTargetKey, nil
+            end
+            state.status, state.detail = "Retrying movement", "No approach progress for eight seconds; rebuilding the route."
+            return
+        end
+    else movementWatch = nil end
+    local distance = (targetRoot.Position - root.Position).Magnitude
+    state.status = orbitReady and "Orbiting / Dragonstorm aura" or "Moving above target"
+    state.detail = string.format("%s  |  %d studs", state.target.Name, math.floor(distance))
+end
+
+local function auraStep()
+    if state.auraBlocked then return end
+    local character, _, root = characterParts()
+    local tool = character and character:FindFirstChild("Dragonstorm")
+    if not tool or not tool:IsA("Tool") then state.aura = "Unequipped" return end
+    local shotPart = chooseShotPart(root, collectTargets(root))
+    if not shotPart then state.aura = "Ready; no nearby NPC" return end
+    local remote, validator = getShotRemotes()
+    if not remote or not validator then state.aura = "Waiting for gun remotes" return end
+    local ready, reason = initDragon()
+    if not ready then state.aura = reason return end
+    if not state.running or state.teleporting or player.Character ~= character or tool.Parent ~= character then return end
+    shootDragonstorm(tool, character, shotPart, remote, validator)
+    state.aura = "Active"
+end
+
+function App:SetFarming(enabled)
+    if not state.running then
+        return
+    end
+    state.farming = enabled == true
+    state.target = nil
+    state.emptySince = nil
+    if not state.farming then resetAutoCards(true) end
+    releaseMovement()
+    releaseV4Key()
+    if state.farming then
+        state.auraBlocked = false
+        shootFunction, shotIndices = nil, nil
+        nextInitAttempt = -math.huge
+    end
+    state.status = state.farming and "Starting dungeon farm" or "Farm paused"
+    state.detail = state.farming and "Searching for Dragonstorm and nearby enemies." or "Movement paused. Equipped Dragonstorm aura remains active."
+end
+
+local function visibleGui(object)
+    local current = object
+    while current and current ~= playerGui do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return current == playerGui
+end
+
+local function ensureContinuation()
+    if queuedContinuation then return true end
+    local queue = queue_on_teleport or queueonteleport
+        or type(syn) == "table" and syn.queue_on_teleport
+    if type(queue) ~= "function" then
+        continuationError = "queue_on_teleport unavailable"
+        return false
+    end
+    if type(writefile) ~= "function" or type(readfile) ~= "function" or type(makefolder) ~= "function" then
+        continuationError = "Executor file APIs unavailable"
+        return false
+    end
+    local source = environment.KaitunDungeonSource
+    if type(source) ~= "string" or #source < 1000 then
+        continuationError = "Run the complete bundled Lua"
+        return false
+    end
+    local ok, err = pcall(function()
+        if not isfolder("KaitunDungeon") then makefolder("KaitunDungeon") end
+        writefile(sourcePath, source)
+        if environment.KaitunTeleportQueued ~= game.JobId then
+            local accepted = queue('local e=(getgenv and getgenv()) or _G; e.KaitunQueuedFromJob='
+                .. string.format("%q", game.JobId) .. '; e.KaitunDungeonSource=readfile('
+                .. string.format("%q", sourcePath) .. '); assert(loadstring(e.KaitunDungeonSource))()')
+            assert(accepted ~= false, "Executor rejected the teleport reload queue.")
+            environment.KaitunTeleportQueued = game.JobId
+        end
+    end)
+    queuedContinuation, continuationReady = ok, ok
+    continuationError = not ok and tostring(err) or nil
+    return ok
+end
+
+local function savePartyProfile(config, enabled)
+    if sharedStore then
+        sharedStore:Write("profile-" .. player.UserId, { config = config, enabled = enabled == true, time = sharedClock() })
+    end
+end
+
+local function startParty(config)
+    if not partyRuntime then return false, syncError or "Shared file APIs are unavailable." end
+    local okay, reason = partyRuntime:SetConfig(config)
+    if not okay then return false, reason end
+    partyWanted = true
+    App:SetFarming(true)
+    savePartyProfile(config, true)
+    ensureContinuation()
+    return partyRuntime:Start()
+end
+
+local function stopParty()
+    if partyRuntime then partyRuntime:Stop() end
+    partyWanted = false
+    savePartyProfile(partyRuntime and partyRuntime.config, false)
+    App:SetFarming(false)
+end
+
+local function initializeParty()
+    local fs = { readfile = readfile, writefile = writefile, isfile = isfile,
+        isfolder = isfolder, makefolder = makefolder, listfiles = listfiles }
+    local codec = { encode = function(value) return HttpService:JSONEncode(value) end,
+        decode = function(value) return HttpService:JSONDecode(value) end }
+    sharedStore, syncError = SharedFiles.new(fs, codec, "KaitunDungeon")
+    if not sharedStore then return end
+    local function currentWorld()
+        local character, _, root = characterParts()
+        local room = root and roomAt(root)
+        local phase = lobbyAdapter and lobbyAdapter:Phase() or "unknown"
+        local loaded = phase ~= "dungeon" or dungeonFolder() ~= nil and workspace:FindFirstChild("Enemies") ~= nil
+        return { jobId = game.JobId, placeId = game.PlaceId, phase = phase, alive = character ~= nil,
+            ready = state.farming and character ~= nil
+                and loaded and not state.teleporting and (phase ~= "lobby" or continuationReady),
+            choosingCard = cardAuto.active, cardMovementBlocked = cardAuto.movementBlocked == true,
+            movementTarget = root and state.target and (function()
+                local descriptor = describeTarget(state.target, root)
+                if descriptor then descriptor.object = nil end
+                return descriptor
+            end)() or nil,
+            roomKey = room and room.key, teleporting = state.teleporting == true,
+            position = root and { root.Position.X, root.Position.Y, root.Position.Z } or nil }
+    end
+    local function candidates()
+        local _, _, root = characterParts()
+        return root and describeTargets(collectTargets(root), root) or {}
+    end
+    local deps = { player = { userId = player.UserId, name = player.Name },
+        sessionId = HttpService:GenerateGUID(false), storage = sharedStore, clock = sharedClock,
+        world = currentWorld, targets = candidates,
+        presentIds = function()
+            local ids = {} for _, member in ipairs(Players:GetPlayers()) do ids[member.UserId] = true end return ids
+        end,
+        ensureContinuation = ensureContinuation,
+        joinLobby = function(world, leader) return serverJoin:Step(world, leader) end,
+        findEmptyPad = function(rejected) return lobbyAdapter:FindEmpty(rejected) end,
+        readPad = function(key) return lobbyAdapter:Read(key) end,
+        applyPad = function(decision, key) return lobbyAdapter:Apply(decision, key) end,
+        abortPad = function(key, reason) if key then lobbyAdapter:Abort(key, reason) end end,
+        getProof = function(key) return key and lobbyAdapter:Proof(key) end,
+        checkEntry = function(key) return lobbyAdapter:EntryStep(key) end,
+        onConfig = function(config)
+            savePartyProfile(config, true)
+            if partyForm then partyForm:Load(config, true) end
+        end,
+    }
+    partyRuntime = PartyRuntime.new(deps, PartyCore, TargetRegistry, DungeonRecovery, LocalCombat)
+    lobbyAdapter = LobbyAdapter.new({ workspace = workspace, players = Players, player = player,
+        config = function() return partyRuntime.config end, clock = sharedClock,
+        configEpoch = function() return partyRuntime.configEpoch end,
+        leaderState = function() return partyRuntime.snapshot end,
+        root = function() local _, humanoid, root = characterParts() return humanoid, root end,
+        release = releaseMovement, ensureContinuation = ensureContinuation,
+        queueVisible = function()
+            local menu = playerGui:FindFirstChild("DungeonQueueSettingsMenu")
+            if not menu or not visibleGui(menu) then return false end
+            local frame = menu:FindFirstChild("RootFrame")
+            return not frame or visibleGui(frame)
+        end,
+        publishProof = function(key, proof)
+            local snapshot = partyRuntime.snapshot
+            if snapshot and snapshot.padKey == key then
+                snapshot.proof, snapshot.time = proof, sharedClock()
+                sharedStore:Write("state-" .. partyRuntime.config.leaderId, snapshot)
+            end
+        end,
+        move = function(goal)
+            local _, _, root = characterParts()
+            if not root then return false, "Waiting for your character." end
+            if movementRoot ~= root then releaseMovement() movementRoot = root end
+            if (root.Position - goal.Position).Magnitude < 1.5 then cancelTween() return true end
+            if movementTween and movementTween.PlaybackState == Enum.PlaybackState.Playing
+                and movementGoal and (movementGoal - goal.Position).Magnitude < 1 then return true end
+            releaseMovement()
+            movementRoot, movementGoal = root, goal.Position
+            movementTween = TweenService:Create(root,
+                TweenInfo.new(math.max((root.Position - goal.Position).Magnitude / Config.MoveSpeed, 0.1), Enum.EasingStyle.Linear),
+                { CFrame = goal })
+            movementTween:Play()
+            return true
+        end,
+    }, PadSafety)
+    ensureContinuation()
+    local saved = sharedStore:Read("profile-" .. player.UserId, function(value)
+        return PartyCore.ValidateConfig(value.config)
+    end)
+    if saved then
+        partyRuntime:SetConfig(saved.config)
+        if saved.enabled then startParty(saved.config) end
+    end
+end
+
+function App:GetState()
+    return {
+        running = state.running,
+        farming = state.farming,
+        status = state.status,
+        detail = state.detail,
+        target = state.target,
+        shots = state.shots,
+        weapon = Config.WeaponName,
+        version = App.Version,
+        orbiting = orbitActive,
+
+        choosingCard = cardAuto.active,
+        cardChoice = cardAuto.title,
+        cardMethod = cardAuto.method,
+        abilities = table.clone(state.abilities),
+        abilityErrors = table.clone(state.abilityErrors),
+        party = partyRuntime and { enabled = partyRuntime.enabled, status = partyRuntime.status,
+            config = partyRuntime.config, phase = lobbyAdapter:Phase() } or nil,
+        aura = state.aura,
+        objectives = state.objectiveCount or 0,
+        returningToHub = returnToHub and (returnToHub.active or returnToHub.pendingUntil ~= nil),
+        recoveringRoom = state.recoveringRoom,
+    }
+end
+
+function App:Shutdown()
+    if not state.running then
+        return
+    end
+
+    if partyRuntime then partyRuntime:Stop() end
+    self:SetFarming(false)
+    state.running = false
+    if ui.showTween then
+        ui.showTween:Cancel()
+        ui.showTween = nil
+    end
+    if checks then checks:Hide() end
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+    table.clear(connections)
+    if ui.gui then
+        ui.gui:Destroy()
+    end
+    if environment[sessionKey] == self then
+        environment[sessionKey] = nil
+    end
+end
+
+-- UI: charcoal surfaces, warm orange accent, compact layout, mouse/touch support.
+local colors = {
+    background = Color3.fromRGB(16, 20, 27),
+    surface = Color3.fromRGB(24, 30, 39),
+    border = Color3.fromRGB(44, 54, 68),
+    text = Color3.fromRGB(239, 243, 249),
+    muted = Color3.fromRGB(153, 168, 187),
+    accent = Color3.fromRGB(255, 156, 72),
+    green = Color3.fromRGB(94, 220, 165),
+}
+
+local function make(className, properties, parent)
+    local instance = Instance.new(className)
+    for key, value in pairs(properties) do
+        instance[key] = value
+    end
+    instance.Parent = parent
+    return instance
+end
+
+local function capturePanelInput(object)
+    object.Active = true
+    -- Newer clients expose explicit sinking; the button surface also catches
+    -- clicks on clients that still use the older Active behavior.
+    pcall(function() object.InputSink = Enum.InputSink.All end)
+    return object
+end
+
+local function rounded(instance, radius)
+    make("UICorner", { CornerRadius = UDim.new(0, radius or 10) }, instance)
+    return instance
+end
+
+local function label(parent, text, position, size, textSize, color)
+    return make("TextLabel", {
+        BackgroundTransparency = 1, Position = position, Size = size,
+        Font = Enum.Font.Gotham, Text = text, TextSize = textSize or 13,
+        TextColor3 = color or colors.text, TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+    }, parent)
+end
+
+local function button(parent, text, position, size, accent)
+    local result = rounded(make("TextButton", {
+        BackgroundColor3 = accent and colors.accent or colors.surface,
+        BorderSizePixel = 0, Position = position, Size = size,
+        Font = Enum.Font.GothamMedium, Text = text, TextSize = 13,
+        TextColor3 = accent and colors.background or colors.text,
+        AutoButtonColor = true, Active = true,
+    }, parent))
+    if not accent then
+        make("UIStroke", { Color = colors.border, Thickness = 1 }, result)
+    end
+    return result
+end
+
+ui.gui = make("ScreenGui", {
+    Name = "KaitunDungeon", ResetOnSpawn = false,
+    IgnoreGuiInset = true, DisplayOrder = 80, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+ui.host = make("Frame", {
+    Name = "Panel", AnchorPoint = Vector2.new(0, 0),
+    Position = UDim2.fromOffset(16, 50), Size = UDim2.fromOffset(420, 322),
+    BackgroundTransparency = 1, Visible = false,
+}, ui.gui)
+ui.scale = make("UIScale", { Scale = 1 }, ui.host)
+ui.panel = capturePanelInput(rounded(make("TextButton", {
+    Name = "Surface", AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(420, 322),
+    BackgroundColor3 = colors.background, BorderSizePixel = 0,
+    Text = "", AutoButtonColor = false, Active = true, Selectable = false,
+}, ui.host), 16))
+make("UIStroke", { Color = colors.border, Thickness = 1 }, ui.panel)
+ui.zoom = make("UIScale", { Scale = 1 }, ui.panel)
+local header = capturePanelInput(make("Frame", {
+    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 76), Active = true,
+}, ui.panel))
+rounded(make("Frame", {
+    BackgroundColor3 = colors.accent, BorderSizePixel = 0,
+    Position = UDim2.fromOffset(20, 23), Size = UDim2.fromOffset(5, 30),
+}, header), 3)
+label(header, "Kaitun Dungeon", UDim2.fromOffset(37, 19), UDim2.fromOffset(250, 24), 21)
+label(header, "Dragonstorm only", UDim2.fromOffset(38, 45), UDim2.fromOffset(270, 18), 12, colors.accent)
+local minimize = button(header, "-", UDim2.fromOffset(332, 23), UDim2.fromOffset(29, 29))
+local close = button(header, "x", UDim2.fromOffset(370, 23), UDim2.fromOffset(29, 29))
+ui.body = make("Frame", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(20, 84), Size = UDim2.fromOffset(380, 218),
+}, ui.panel)
+local card = rounded(make("Frame", {
+    BackgroundColor3 = colors.surface, BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 0, 78),
+}, ui.body), 12)
+ui.status = label(card, state.status, UDim2.fromOffset(14, 12), UDim2.fromOffset(352, 24), 14)
+ui.status.TextTruncate = Enum.TextTruncate.AtEnd
+ui.target = label(card, "TARGET  --", UDim2.fromOffset(14, 48), UDim2.fromOffset(352, 16), 11, colors.muted)
+ui.farm = button(ui.body, "START DUNGEON FARM", UDim2.fromOffset(0, 92), UDim2.new(1, 0, 0, 46), true)
+ui.detail = label(ui.body, state.detail, UDim2.fromOffset(2, 150), UDim2.fromOffset(376, 60), 12, colors.muted)
+ui.detail.TextWrapped = true
+ui.detail.TextYAlignment = Enum.TextYAlignment.Top
+ui.shortcutHint = label(ui.panel, "G: Show / hide UI", UDim2.new(0, 20, 1, -26), UDim2.fromOffset(380, 16), 11, colors.muted)
+ui.shortcutHint.Name = "ShortcutHint"
+local launcher = button(ui.gui, "KD", UDim2.new(1, -70, 1, -105), UDim2.fromOffset(48, 48), true)
+launcher.Name = "ShowHide"
+
+connect(ui.farm.Activated, function()
+    App:SetFarming(not state.farming)
+end)
+connect(close.Activated, function()
+    App:Shutdown()
+end)
+local compact = false
+connect(minimize.Activated, function()
+    compact = not compact
+    ui.body.Visible = not compact and not ui.lobbyVisible
+    ui.shortcutHint.Visible = not compact
+    if partyForm then partyForm.host.Visible = not compact and ui.lobbyVisible == true end
+    ui.panel.Size = UDim2.fromOffset(420, compact and 76 or (ui.lobbyVisible and 536 or 322))
+    ui.host.Size = ui.panel.Size
+    minimize.Text = compact and "+" or "-"
+end)
+showPanel = function()
+    if not state.running then
+        return
+    end
+    if ui.showTween then
+        ui.showTween:Cancel()
+    end
+    ui.zoom.Scale = 0.05
+    ui.host.Visible = true
+    ui.showTween = TweenService:Create(ui.zoom,
+        TweenInfo.new(Config.ShowDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Scale = 1 })
+    ui.showTween:Play()
+end
+hidePanel = function()
+    if ui.showTween then ui.showTween:Cancel() ui.showTween = nil end
+    ui.host.Visible = false
+    ui.zoom.Scale = 1
+end
+local function toggleVisibility()
+    if ui.host.Visible then
+        hidePanel()
+    else
+        showPanel()
+    end
+end
+connect(launcher.Activated, toggleVisibility)
+connect(UserInputService.InputBegan, function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.G then
+        toggleVisibility()
+    end
+end)
+connect(UserInputService.WindowFocused, function() windowFocused = true end)
+connect(UserInputService.WindowFocusReleased, function() windowFocused = false releaseCardMouse() end)
+
+local dragInput, dragStart, panelStart
+connect(header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput, dragStart, panelStart = input, input.Position, ui.host.Position
+    end
+end)
+connect(UserInputService.InputChanged, function(input)
+    if dragInput and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local delta = input.Position - dragStart
+        ui.host.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X,
+            panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+    end
+end)
+connect(UserInputService.InputEnded, function(input)
+    if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragInput = nil
+    end
+end)
+
+local function uiFactory(parent)
+    return { make = make, label = label, button = button, rounded = rounded,
+        connect = connect, colors = colors, parent = parent,
+        clock = os.clock,
+        tween = function(object, values, duration, easing)
+            local tween = TweenService:Create(object, TweenInfo.new(duration, easing or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), values)
+            tween:Play() return tween
+        end }
+end
+local function activateGameButton(button, attempt, clearedPanel)
+    local useSignal = type(firesignal) == "function" and attempt <= 2
+    if not useSignal then
+        if not windowFocused then return false, "Game button is waiting for Roblox focus.", false end
+        if not VirtualInputManager then return false, "Game button needs a supported GUI activation API.", false end
+        if ui.host.Visible then
+            if clearedPanel then clearedPanel() end
+            hidePanel()
+            return false, "Clearing the main panel from the game button.", false
+        end
+    end
+    local attempted = false
+    local ok, reason = pcall(function()
+        if useSignal then
+            local signalName = attempt == 2 and "Activated" or "MouseButton1Click"
+            if type(getconnections) == "function" and attempt == 1
+                and #getconnections(button.MouseButton1Click) == 0 and #getconnections(button.Activated) > 0 then signalName = "Activated" end
+            attempted = true
+            firesignal(button[signalName])
+            return
+        end
+        local screen = button.Parent
+        while screen and not screen:IsA("ScreenGui") do screen = screen.Parent end
+        assert(screen, "Game screen changed; waiting for its button.")
+        local x, y = cardClickPosition({ button = button, screen = screen })
+        assert(x, "Game button is covered by another UI.")
+        releaseCardMouse()
+        local token = cardAuto.token
+        cardAuto.mouseX, cardAuto.mouseY, cardAuto.mouseHeld = x, y, true
+        attempted = true
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.delay(0.05, function() if cardAuto.token == token then releaseCardMouse() end end)
+    end)
+    if not ok then releaseCardMouse() end
+    return ok, reason, attempted
+end
+local partyOkay, partyError = pcall(initializeParty)
+if not partyOkay then
+    syncError = tostring(partyError)
+    lobbyAdapter = LobbyAdapter.new({ workspace = workspace }, PadSafety)
+end
+connect(TeleportService.TeleportInitFailed, function(who, _, message, placeId)
+    if who ~= player or not state.running then return end
+    state.teleporting = false
+    if returnToHub then returnToHub:OnTeleportFailed() end
+    if partyRuntime then partyRuntime:OnTeleportFailed(message, placeId) end
+end)
+if player.OnTeleport then
+    connect(player.OnTeleport, function(teleportState)
+        if teleportState == Enum.TeleportState.RequestedFromServer or teleportState == Enum.TeleportState.Started
+            or teleportState == Enum.TeleportState.WaitingForServer or teleportState == Enum.TeleportState.InProgress then
+            state.teleporting = true
+            releaseMovement()
+            releaseV4Key()
+            releaseCardMouse()
+            state.target, shootFunction, shotIndices = nil, nil, nil
+        elseif teleportState == Enum.TeleportState.Failed then
+            state.teleporting = false
+            if returnToHub then returnToHub:OnTeleportFailed() end
+        end
+    end)
+end
+checks = StatusPanel.Create(uiFactory(ui.gui))
+partyForm = PartyForm.Create(uiFactory(ui.panel), PartyCore, {
+    onConfirm = function(normalized, done)
+        task.spawn(function()
+            local config, reason = PartyCore.ResolveConfig(normalized, function(name)
+                if name:lower() == player.Name:lower() then return player.UserId end
+                return Players:GetUserIdFromNameAsync(name)
+            end)
+            if state.running then done(config, reason) end
+        end)
+    end,
+    onStart = startParty, onStop = stopParty,
+}, { player.Name })
+capturePanelInput(partyForm.host)
+partyForm.host.AnchorPoint = Vector2.new(0.5, 0)
+partyForm.host.Position = UDim2.new(0.5, 0, 0, 76)
+partyForm.host.Visible = false
+if partyRuntime and partyRuntime.config then partyForm:Load(partyRuntime.config, partyRuntime.enabled) end
+serverJoin = ServerBrowserJoin.new({
+    gui = playerGui, replicated = ReplicatedStorage, clock = sharedClock,
+    visible = cardVisible, text = cardText,
+    activate = function(button, attempt)
+        return activateGameButton(button, attempt, function() serverJoin.restorePanel = true end)
+    end,
+    request = function(remote, jobId, placeId)
+        local controller = partyRuntime
+        local request = controller.joinRequest
+        task.spawn(function()
+            local result = table.pack(pcall(function() return remote:InvokeServer("teleport", jobId) end))
+            if not result[1] or result[2] == false then
+                local reason = not result[1] and tostring(result[2])
+                    or type(result[3]) == "string" and result[3] or "Game server browser declined the join request."
+                task.defer(function()
+                    if state.running and controller == partyRuntime and controller.enabled
+                        and controller.joinRequest == request then
+                        controller:OnTeleportFailed(reason, placeId)
+                    end
+                end)
+            end
+        end)
+    end,
+})
+returnToHub = ReturnToHub.new({
+    gui = playerGui, ownGui = ui.gui, clock = os.clock,
+    visible = cardVisible, visibleText = visibleGui, text = cardText, release = releaseMovement,
+    allowed = function() return state.running and not state.teleporting and lobbyAdapter:Phase() == "dungeon" and not cardAuto.active end,
+    status = function(status, detail) state.status, state.detail = status, detail state.target = nil end,
+    click = function(button, attempt)
+        return activateGameButton(button, attempt, function() returnToHub.restorePanel = true end)
+    end,
+})
+
+local seenChecks = {}
+local partyChecks = {
+    ["party-start"] = "Party sync", ["settings-wait"] = "Party sync", ["party-wait"] = "Party sync",
+    ["sync-error"] = "Party sync", ["joining-server"] = "Server check", ["join-retry"] = "Server join",
+    ["continuation-wait"] = "Teleport check", ["leader-not-in-lobby"] = "Server check",
+    ["dungeon-entry"] = "Dungeon entry", ["join-blocked"] = "Server join", ["dungeon-finish"] = "Dungeon check",
+    ["leader-enter"] = "Leader check", ["member-enter"] = "Leader check", configure = "Mode check",
+    start = "Start check", countdown = "Start check", ["pad-cancel"] = "Party check",
+    ["pad-reentry"] = "Pad entry check",
+}
+local function renderChecks(phase)
+    local character = characterParts()
+    local runtime = partyRuntime and partyRuntime.enabled and partyRuntime or nil
+    local activeRoom = runtime and runtime.snapshot and runtime.snapshot.activeRoom
+    local observer = activeRoom and tostring(activeRoom.userId) .. ":" .. activeRoom.sessionId
+    local currentRoom = character and roomAt(select(3, characterParts()))
+    local key, title, message, okay
+    if not character then
+        key, title, message = "respawning", "Respawn check", "Waiting for your character to respawn."
+    elseif state.recoveringRoom then
+        key, title, message = "recover:" .. state.recoveringRoom, "Room recovery", "Rejoining the party through the current room's exit."
+    elseif seenChecks.recovering and currentRoom and currentRoom.key == seenChecks.recovering then
+        key, title, message, okay = "rejoined:" .. seenChecks.recovering, "Room check", "Party room rejoined. Combat can resume.", true
+    elseif runtime and partyChecks[runtime.stage] then
+        key, title, message = "party:" .. runtime.stage, partyChecks[runtime.stage], runtime.status
+        okay = runtime.stage == "countdown" or runtime.stage == "start" or runtime.stage == "member-enter"
+    elseif state.auraBlocked then
+        key, title, message = "attack-error", "Dragonstorm check", "Attack failed. Restart farming to retry."
+    elseif state.status == "Dragonstorm not found" or state.aura == "Waiting for gun remotes" then
+        key, title, message = "gun-dependency", "Dragonstorm check", state.status == "Dragonstorm not found" and "Waiting for Dragonstorm in the Backpack." or state.aura
+    elseif returnToHub and (returnToHub.active or returnToHub.pendingUntil) then
+        key, title, message = "hub-return", "Return check", "Skipping the completion countdown and waiting for the hub transfer."
+    elseif cardAuto.error then
+        key, title, message = "card-error:" .. cardAuto.error, "Card check", cardAuto.error
+    elseif cardAuto.active then
+        key, title, message = "card-choice", "Card check", "Choosing a gun upgrade or the random fallback."
+    elseif observer and observer ~= seenChecks.observer then
+        key, title, message, okay = "observer:" .. observer, "Combat sync", "A live party account is providing the active room's targets.", true
+    elseif (state.objectiveCount or 0) > 0 and not seenChecks.objectives then
+        key, title, message, okay = "objectives", "Objective check", "Boss objective hitboxes detected. Clearing them first.", true
+    elseif phase ~= seenChecks.phase then
+        key, title = "world:" .. phase, "Dungeon check"
+        message = phase == "lobby" and "Dungeon lobby confirmed." or phase == "dungeon" and "Dungeon instance confirmed." or "Waiting for the dungeon map to load."
+        okay = phase ~= "unknown"
+    elseif character and seenChecks.alive == false then
+        key, title, message, okay = "respawned", "Respawn check", "Character loaded. Checking the active party room.", true
+    end
+    if key then checks:Notify(key, title, message, okay) end
+    seenChecks.phase, seenChecks.alive = phase, character ~= nil
+    seenChecks.recovering, seenChecks.observer = state.recoveringRoom, observer
+    seenChecks.objectives = (state.objectiveCount or 0) > 0
+    checks:Update()
+end
+
+local function render()
+    local phase = lobbyAdapter:Phase()
+    if returnToHub.restorePanel and not returnToHub.active and not returnToHub.pendingUntil then
+        returnToHub.restorePanel = false
+        showPanel()
+    end
+    if serverJoin.restorePanel and phase == "lobby" then serverJoin.restorePanel = false showPanel() end
+    local lobby = phase ~= "dungeon"
+    if ui.lobbyVisible ~= lobby then
+        ui.lobbyVisible = lobby
+        ui.body.Visible, partyForm.host.Visible = not lobby and not compact, lobby and not compact
+        ui.panel.Size = UDim2.fromOffset(420, compact and 76 or lobby and 536 or 322)
+        ui.host.Size = ui.panel.Size
+    end
+    if partyRuntime and partyRuntime.enabled then
+        partyForm:SetStatus(phase == "lobby" and not continuationReady and continuationError
+            and "Automatic entry is waiting: " .. continuationError or partyRuntime.status)
+    elseif syncError and lobby then partyForm:SetStatus(syncError) end
+
+    ui.farm.Text = state.farming and "PAUSE DUNGEON FARM" or "START DUNGEON FARM"
+    ui.farm.BackgroundColor3 = state.farming and colors.green or colors.accent
+    ui.status.Text = state.status
+    ui.status.TextColor3 = state.farming and colors.green or colors.text
+    ui.target.Text = "TARGET  " .. (state.target and state.target.Name or "--")
+    ui.target.TextTruncate = Enum.TextTruncate.AtEnd
+    ui.detail.Text = state.detail
+    local abilityMessage
+    for _, name in ipairs({ "Haki", "Ken", "V3", "V4" }) do
+        local err = state.abilityErrors[name]
+        if err and not abilityMessage then
+            abilityMessage = name .. ": " .. err
+        end
+    end
+    if abilityMessage then
+        ui.detail.Text = state.detail .. "\n" .. abilityMessage
+    end
+    local camera = workspace.CurrentCamera
+    if camera then
+        local size = camera.ViewportSize
+        ui.scale.Scale = math.clamp(math.min((size.X - 32) / 420, (size.Y - 66) / (lobby and 536 or 322)), 0.35, 1)
+    end
+    renderChecks(phase)
+end
+
+connect(player.CharacterRemoving, function()
+    state.target = nil
+    state.emptySince = nil
+    state.nextRoomAt = 0
+    state.exitPosition = nil
+    state.exitArmed = true
+    state.recoveringRoom = nil
+    state.combatRoomKey, state.sawRoomTargets = nil, false
+    catchUp = {}
+    table.clear(usedExits)
+    if partyRuntime then
+        partyRuntime.cachedTarget, partyRuntime.unresolvedKey, partyRuntime.unresolved = nil, nil, false
+    end
+    shootFunction, shotIndices = nil, nil
+    nextInitAttempt = -math.huge
+    releaseMovement()
+    releaseV4Key()
+    for name in pairs(lastAbility) do
+        lastAbility[name] = -math.huge
+    end
+end)
+local elapsed = 0
+local uiElapsed = 0
+local busy = false
+connect(RunService.Heartbeat, function(deltaTime)
+    if not state.running or busy then
+        return
+    end
+    elapsed = elapsed + deltaTime
+    if elapsed < Config.UpdateInterval then
+        return
+    end
+    elapsed = 0
+    busy = true
+    local ok, err = pcall(function()
+        if state.teleporting then
+            state.status, state.detail = "Teleporting", "Waiting for the game to finish the server transfer."
+            return
+        end
+        autoCardStep()
+        if not returnToHub:Step() then
+            if partyRuntime then partyRuntime:Tick() end
+            supportStep()
+            farmStep()
+            auraStep()
+        end
+    end)
+    busy = false
+    if not state.running then
+        return
+    end
+    if not ok then
+        state.auraBlocked, state.aura = true, "Error; restart farm"
+        App:SetFarming(false)
+        state.status, state.detail = "Farm stopped after an error", tostring(err)
+        warn("[Kaitun Dungeon] " .. tostring(err))
+    end
+    uiElapsed = uiElapsed + deltaTime
+    if uiElapsed >= Config.UIUpdateInterval then
+        uiElapsed = 0
+        render()
+    end
+end)
+
+environment[sessionKey] = App
+App:SetFarming(Config.AutoStart)
+render()
+if lobbyAdapter:Phase() == "dungeon" then hidePanel() else showPanel() end
+return App
+
+]====]
+local env = (type(getgenv) == "function" and getgenv()) or _G
+env.KaitunDungeonSource = source
+return assert(loadstring(source, "Kaitun Dungeon"))()
