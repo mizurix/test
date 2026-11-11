@@ -1,6 +1,6 @@
--- Kaitun Dungeon v1.13
+-- Kaitun Dungeon v1.14
 local source = [====[
--- Kaitun Dungeon v1.13
+-- Kaitun Dungeon v1.14
 -- Standalone client script. No UI libraries or remote code downloads.
 -- Dungeon logic: banana 28980-29210.
 -- Dragonstorm attack: find dragon aura.lua 750-991 (NPC aura; movement is coordinated).
@@ -187,10 +187,18 @@ function Party.JoinDecision(config, peers, leader, presentIds, pad, userId, now)
         return { action = "hold", reason = "Waiting for the leader's join menu." }
     end
     if userId ~= config.leaderId then
+        if pad.configured == false then
+            return { action = "wait", reason = "Waiting for the leader's selected mode to be confirmed." }
+        end
         if type(pad.confirmedAt) ~= "number" or now < pad.confirmedAt + (member.slot - 1) * Party.FollowerDelay then
             return { action = "wait", reason = "Waiting for the leader-first entry delay." }
         end
         if pad.insideIds and pad.insideIds[userId] then return { action = "hold", reason = "Party member is ready on the pad." } end
+        for slot = 2, member.slot - 1 do
+            if not pad.insideIds or not pad.insideIds[config.roster[slot].userId] then
+                return { action = "wait", reason = "Waiting for the previous party member to finish entering." }
+            end
+        end
         return { action = "member-enter", padKey = pad.key }
     end
     if pad.mode ~= config.mode or pad.capacity ~= config.count or pad.configured == false then
@@ -772,6 +780,29 @@ function Runtime:_lobby(now, world, leader)
         return
     end
     if not allHere and not (pad and pad.safety == "countdown") then self.stage, self.status = "party-wait", reason return end
+    if not isLeader and key and leaderState
+        and (leaderState.decision == "recover-owner" or leaderState.decision == "verify-owner") then
+        self.stage, self.status = "pad-ownership", leaderState.reason
+        if leaderState.decision == "recover-owner" and deps.leavePadMember then deps.leavePadMember(key)
+        elseif deps.maintainPad then deps.maintainPad(key) end
+        return
+    end
+    if isLeader and key and deps.checkOwnership then
+        local ownership = deps.checkOwnership(key)
+        if ownership then
+            self.stage, self.status = "pad-ownership", ownership.reason
+            self.snapshot = { time = now, configEpoch = self.configEpoch, phase = "lobby", jobId = world.jobId,
+                placeId = world.placeId, padKey = key, decision = ownership.action, reason = ownership.reason,
+                proof = deps.getProof and deps.getProof(key) or nil }
+            deps.storage:Write("state-" .. config.leaderId, self.snapshot)
+            if ownership.action == "abort" then
+                deps.abortPad(key, ownership.reason)
+                self.rejectedPads[key], self.selectedPad, self.cancelUntil = now, nil, now + 2
+            elseif deps.maintainPad then deps.maintainPad(key) end
+            return
+        end
+        pad = deps.readPad(key)
+    end
     if isLeader and key and deps.checkEntry then
         local held, entryReason, failed = deps.checkEntry(key)
         if held then
@@ -788,6 +819,7 @@ function Runtime:_lobby(now, world, leader)
         end
         pad = deps.readPad(key)
     end
+    if key and deps.maintainPad then deps.maintainPad(key) end
     local decision = self.rules.JoinDecision(config, self.peers, leader, deps.presentIds(), pad, deps.player.userId, now)
     self.status = decision.reason or decision.action
     self.stage = pad and pad.safety == "countdown" and "countdown" or decision.action
@@ -1099,6 +1131,12 @@ local PadSafety = (function()
 local Safety = {}
 function Safety.Check(config, pad, proof, now)
     if not pad or not pad.verified then return "wait", "Waiting for the captured lobby pad." end
+    local partyOwner = pad.ownerId == nil
+    for _, member in ipairs(config.roster) do if member.userId == pad.ownerId then partyOwner = true break end end
+    if pad.ownershipPending and not pad.preparing and not pad.foreignOccupant
+        and partyOwner and proof and proof.menuReady and proof.leaderId == config.leaderId and not proof.startedAt then
+        return "wait", "Rechecking the configured leader before Start."
+    end
     if pad.ownerId and pad.ownerId ~= config.leaderId then
         return "abort", "Pad ownership belongs to another account."
     end
@@ -1137,7 +1175,7 @@ local LobbyAdapter = (function()
 local Adapter = {}
 Adapter.__index = Adapter
 function Adapter.new(deps, safety)
-    return setmetatable({ deps = deps, safety = safety, proofs = {}, owners = {}, confirmed = {}, lastAction = {}, entries = {} }, Adapter)
+    return setmetatable({ deps = deps, safety = safety, proofs = {}, owners = {}, confirmed = {}, lastAction = {}, entries = {}, ownership = {} }, Adapter)
 end
 function Adapter:Phase()
     local world = self.deps.workspace
@@ -1163,6 +1201,9 @@ function Adapter:Read(key)
     if not model then return end
     local config, now = self.deps.config(), self.deps.clock()
     if not config then return end
+    if self.proofs[key] and self.proofs[key].sessionEpoch ~= self.deps.configEpoch() then
+        self.proofs[key], self.entries[key], self.lastAction[key], self.ownership[key] = nil, nil, nil, nil
+    end
     local owner = tonumber(model:GetAttribute("Initiator"))
     if owner == 0 then owner = nil end
     if self.owners[key] ~= owner then self.owners[key], self.confirmed[key] = owner, now end
@@ -1192,6 +1233,10 @@ function Adapter:Read(key)
     local proof = config.leaderId == self.deps.player.UserId and self.proofs[key]
         or (leaderState and leaderState.padKey == key and leaderState.proof)
     if proof and proof.sessionEpoch ~= self.deps.configEpoch() then proof = nil end
+    local partyOwner = owner == nil
+    for _, member in ipairs(config.roster) do if member.userId == owner then partyOwner = true break end end
+    pad.ownershipPending = proof and proof.menuReady and not proof.startedAt and not pad.preparing
+        and partyOwner and (owner ~= config.leaderId or proof.ownershipRecovery ~= nil) or false
     local verdict, reason = self.safety.Check(config, pad, proof, now)
     pad.safety, pad.reason = verdict, reason
     -- No capacity-setting command was observed. Enforce exact roster locally.
@@ -1218,9 +1263,91 @@ function Adapter:FindEmpty(rejected)
     return best
 end
 function Adapter:Proof(key) return self.proofs[key] end
+function Adapter:Goal(key, userId, outside)
+    local _, part = self:Model(key)
+    local config = self.deps.config()
+    if not part or not config then return end
+    local slot
+    for _, member in ipairs(config.roster) do if member.userId == userId then slot = member.slot break end end
+    if not slot then return end
+    local x, z = 0, 0
+    if slot > 1 then
+        local angle = (slot - 2) * math.pi * 2 / 3
+        x = math.cos(angle) * math.min(6, math.max(0, part.Size.X / 2 - 2.5))
+        z = math.sin(angle) * math.min(6, math.max(0, part.Size.Z / 2 - 2.5))
+    end
+    if outside then z = (z < 0 and -1 or 1) * (part.Size.Z / 2 + 12) end
+    return part.CFrame * CFrame.new(x, 3.2, z)
+end
+function Adapter:Maintain(key)
+    local config, pad = self.deps.config(), self:Read(key)
+    if not config or not pad or pad.safety == "abort" then return end
+    local entry = self.entries[key]
+    if entry and (entry.stage == "leaving" or entry.stage == "entering") then return end
+    local id = self.deps.player.UserId
+    if not pad.insideIds[id] and not (id == config.leaderId and pad.ownershipPending) then return end
+    local goal = self:Goal(key, id)
+    if goal then return self.deps.move(goal) end
+end
+function Adapter:LeaveMember(key)
+    local config = self.deps.config()
+    if not config or self.deps.player.UserId == config.leaderId then return end
+    local goal = self:Goal(key, self.deps.player.UserId, true)
+    if goal then return self.deps.move(goal) end
+end
+function Adapter:OwnershipStep(key)
+    local config, pad, now = self.deps.config(), self:Read(key), self.deps.clock()
+    if not config or config.leaderId ~= self.deps.player.UserId or not pad then return end
+    local proof = self.proofs[key]
+    if not proof or proof.sessionEpoch ~= self.deps.configEpoch() or pad.preparing or proof.startedAt then return end
+    local record = self.ownership[key]
+    if not record or record.epoch ~= self.deps.configEpoch() then
+        record = { epoch = self.deps.configEpoch(), attempts = 0 }
+        self.ownership[key] = record
+    end
+    if proof.ownershipRecovery then
+        if now - proof.ownershipRecovery.since > 3 then
+            return { action = "abort", reason = "Leader ownership did not return after members stepped off; retrying entry." }
+        end
+        local membersClear = pad.occupancy == 1 and pad.insideIds[config.leaderId] == true
+        for _, member in ipairs(config.roster) do
+            if member.userId ~= config.leaderId and pad.insideIds[member.userId] then membersClear = false end
+        end
+        if pad.ownerConfirmed and membersClear then
+            record.stableSince = record.stableSince or now
+            if now - record.stableSince >= 0.2 then
+                proof.ownershipRecovery, proof.configured, proof.selectedAt = nil, false, nil
+                record.mismatchSince, record.stableSince = nil, nil
+                return
+            end
+        else record.stableSince = nil end
+        return { action = "recover-owner", reason = "Members are stepping clear so the configured leader can reclaim the pad." }
+    end
+    if pad.ownershipPending then
+        record.mismatchSince = record.mismatchSince or now
+        proof.configured, proof.selectedAt = false, nil
+        if now - record.mismatchSince < 0.5 then
+            return { action = "verify-owner", reason = "A party member was reported as pad owner; verifying before Start." }
+        end
+        if record.attempts >= 2 then
+            return { action = "abort", reason = "Pad leadership keeps changing; retrying leader-first entry." }
+        end
+        record.attempts, record.stableSince = record.attempts + 1, nil
+        proof.ownershipRecovery = { since = now, attempt = record.attempts }
+        return { action = "recover-owner", reason = "Members are stepping clear so the configured leader can reclaim the pad." }
+    end
+    if pad.ownerConfirmed and record.mismatchSince then
+        record.stableSince = record.stableSince or now
+        if now - record.stableSince < 0.2 then
+            return { action = "verify-owner", reason = "Leader ownership returned; confirming it remains stable." }
+        end
+        record.mismatchSince, record.stableSince = nil, nil
+    end
+end
 function Adapter:Abort(key, reason)
     self.proofs[key], self.lastAction[key] = nil, nil
     self.entries[key] = nil
+    self.ownership[key] = nil
     local _, part = self:Model(key)
     local _, root = self.deps.root()
     self.deps.release()
@@ -1284,11 +1411,12 @@ function Adapter:Apply(decision, key)
     local pad = self:Read(key)
     if not pad then return false, "Pad unloaded; waiting for replication." end
     if pad.safety == "abort" then self:Abort(key, pad.reason) return false, pad.reason end
+    if pad.safety == "wait" then return false, pad.reason end
     if decision.action == "leader-enter" or decision.action == "member-enter" then
         if decision.action == "member-enter" and not pad.ownerConfirmed then return false, "Leader ownership is not confirmed." end
         if decision.action == "leader-enter" and pad.ownerId and not pad.ownerConfirmed then return false, "Another account owns the pad." end
-        local _, part = self:Model(key)
-        return self.deps.move(part.CFrame * CFrame.new(0, 3.2, 0))
+        local goal = self:Goal(key, self.deps.player.UserId)
+        return goal and self.deps.move(goal)
     end
     if config.leaderId ~= self.deps.player.UserId or not pad.ownerConfirmed then return false, "Only the verified leader can configure/start." end
     local _, _, remote = self:Model(key)
@@ -1600,7 +1728,7 @@ if type(previous) == "table" and type(previous.Shutdown) == "function" then
     previous:Shutdown()
 end
 
-local App = { Version = "1.13" }
+local App = { Version = "1.14" }
 local partyRuntime, lobbyAdapter, partyForm, checks, sharedStore, syncError
 local returnToHub, serverJoin
 local continuationReady, continuationError, queuedContinuation = false, nil, false
@@ -2675,6 +2803,9 @@ local function initializeParty()
         abortPad = function(key, reason) if key then lobbyAdapter:Abort(key, reason) end end,
         getProof = function(key) return key and lobbyAdapter:Proof(key) end,
         checkEntry = function(key) return lobbyAdapter:EntryStep(key) end,
+        checkOwnership = function(key) return lobbyAdapter:OwnershipStep(key) end,
+        maintainPad = function(key) return lobbyAdapter:Maintain(key) end,
+        leavePadMember = function(key) return lobbyAdapter:LeaveMember(key) end,
         onConfig = function(config)
             savePartyProfile(config, true)
             if partyForm then partyForm:Load(config, true) end
@@ -2704,7 +2835,13 @@ local function initializeParty()
             local _, _, root = characterParts()
             if not root then return false, "Waiting for your character." end
             if movementRoot ~= root then releaseMovement() movementRoot = root end
-            if (root.Position - goal.Position).Magnitude < 1.5 then cancelTween() return true end
+            if (root.Position - goal.Position).Magnitude < 1.5 then
+                cancelTween()
+                local velocity = root.AssemblyLinearVelocity
+                if velocity then root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0) end
+                root.AssemblyAngularVelocity = Vector3.zero
+                return true
+            end
             if movementTween and movementTween.PlaybackState == Enum.PlaybackState.Playing
                 and movementGoal and (movementGoal - goal.Position).Magnitude < 1 then return true end
             releaseMovement()
@@ -3083,6 +3220,7 @@ local partyChecks = {
     ["leader-enter"] = "Leader check", ["member-enter"] = "Leader check", configure = "Mode check",
     start = "Start check", countdown = "Start check", ["pad-cancel"] = "Party check",
     ["pad-reentry"] = "Pad entry check",
+    ["pad-ownership"] = "Leader check",
 }
 local function renderChecks(phase)
     local character = characterParts()
